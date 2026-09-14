@@ -1,0 +1,3 @@
+patchedDependencies:
+  '@gutenye/ocr-common@1.4.8': patches/@gutenye__ocr-common@1.4.8.patch
+  js-clipper@1.0.1: patches/js-clipper@1.0.1.patch

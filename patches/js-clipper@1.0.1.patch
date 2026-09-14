@@ -1,0 +1,19 @@
+diff --git a/clipper.js b/clipper.js
+index cd42dec27993ce61d8efa6baa903ea1407ca33cc..e9de681c1ae76d1205df146ee1ee846cb0e827c8 100644
+--- a/clipper.js
++++ b/clipper.js
+@@ -5952,10 +5952,10 @@ ClipperLib.Clipper.DistanceSqrd = function (pt1, pt2)
+ ClipperLib.Clipper.DistanceFromLineSqrd = function (pt, ln1, ln2)
+ {
+   //The equation of a line in general form (Ax + By + C = 0)
+-  //given 2 points (x�,y�) & (x�,y�) is ...
+-  //(y� - y�)x + (x� - x�)y + (y� - y�)x� - (x� - x�)y� = 0
+-  //A = (y� - y�); B = (x� - x�); C = (y� - y�)x� - (x� - x�)y�
+-  //perpendicular distance of point (x�,y�) = (Ax� + By� + C)/Sqrt(A� + B�)
++  //given 2 points (x¹,y¹) & (x²,y²) is ...
++  //(y¹ - y²)x + (x² - x¹)y + (y² - y¹)x¹ - (x² - x¹)y¹ = 0
++  //A = (y¹ - y²); B = (x² - x¹); C = (y² - y¹)x¹ - (x² - x¹)y¹
++  //perpendicular distance of point (x³,y³) = (Ax³ + By³ + C)/Sqrt(A² + B²)
+   //see http://en.wikipedia.org/wiki/Perpendicular_distance
+   var A = ln1.Y - ln2.Y;
+   var B = ln2.X - ln1.X;
