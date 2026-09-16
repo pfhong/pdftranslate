@@ -166,7 +166,7 @@ export function WhalePet() {
       return;
 
     /**
-     * 二维码取源：默认按未就绪处理（不展示），加载并通过校验后才允许展示。
+     * 二维码取源：默认"未就绪"（不展示），加载并通过校验后才允许展示。
      * 桌面端由 Rust 提供内置图片并校验。
      */
     let qr: QrSource | null = null;
