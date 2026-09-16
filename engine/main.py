@@ -11,16 +11,22 @@
 from __future__ import annotations
 
 import base64
+import logging
+import re
+from pathlib import Path
 
 import fitz
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from . import BUILD, __version__
+from . import BUILD, __version__, compute_build
 from . import glossary_store
+from . import parent_watch
 from .layout import extract_pages, get_ocr
 from .synthesize import synthesize
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Transfer Reader Engine", version=__version__)
 app.add_middleware(
@@ -30,15 +36,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _stop_local_model() -> None:
+    from .local_model import local_model
+
+    local_model.stop()
+
+
+# 由桌面应用拉起时（带 TR_PARENT_PID）启用父进程守望：应用一退出就一起退出，
+# 顺带关掉本地模型（llama-server 是引擎的子进程，不管它会留下孤儿）。
+# 手动启动不带该变量，守望不启用——那是开发者自己的进程，应用不该插手。
+parent_watch.start_from_env(on_exit=_stop_local_model)
+
 
 @app.get("/health")
 def health() -> dict:
     ocr = get_ocr()
+    # 进程内指纹 vs 磁盘指纹：不一致说明这个常驻进程跑的是旧代码（应用重启不会
+    # 重拉已占用端口的旧实例，前端据此提示用户重启引擎）
+    on_disk = compute_build()
     return {
         "ok": True,
         "engine": "python",
         "version": __version__,
         "build": BUILD,
+        "buildOnDisk": on_disk,
+        "stale": on_disk != BUILD,
         "ocr": ocr is not None,
     }
 
@@ -221,6 +243,16 @@ async def local_model_start(request: Request) -> JSONResponse:
     model_path = str(payload.get("modelPath") or "").strip()
     if not model_path:
         return JSONResponse({"error": "缺少模型文件路径"}, status_code=400)
+    # 只传调用方明确给的值，其余用 local_model 里的默认值——
+    # 上下文/线程/并发槽位是按实测选的，别在这里写死把它们覆盖掉
+    # （曾因这里写死 -c 2048 配 4 槽，每槽只剩 512，长段落会被截断）
+    kwargs: dict = {}
+    for key, cast in (("port", int), ("ctx", int), ("threads", int), ("timeout", float)):
+        if payload.get(key) is not None:
+            kwargs[key] = cast(payload[key])
+    # gpuLayers: 不传 = 自动（有 GPU 设备就全部卸载）；0 = 强制纯 CPU
+    if payload.get("gpuLayers") is not None:
+        kwargs["gpu_layers"] = int(payload["gpuLayers"])
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -228,10 +260,7 @@ async def local_model_start(request: Request) -> JSONResponse:
             lambda: local_model.start(
                 model_path,
                 server_path=(payload.get("serverPath") or None),
-                port=int(payload.get("port", 8818)),
-                ctx=int(payload.get("ctx", 2048)),
-                threads=int(payload.get("threads", 4)),
-                timeout=float(payload.get("timeout", 300)),
+                **kwargs,
             ),
         )
     except Exception as err:  # noqa: BLE001
@@ -260,6 +289,27 @@ def _extract_glossary_from_system(system_text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+# 目标语言只出现在系统提示词里：OpenAI 协议本身没有"目标语言"这个字段，
+# 所以前端把语言写进了提示词文案（见 src/lib/translate.ts 的 systemPrompt /
+# batchSystemPrompt）。两边的措辞是一份约定，改文案必须同步改这里。
+_TARGET_LANG_PATTERNS = (
+    re.compile(r"把用户给出的内容翻译为(.+?)[。\n]"),
+    re.compile(r"请将每段翻译为(.+?)[。\n]"),
+    re.compile(r"翻译为(.+?)[。\n]"),
+)
+
+
+def _extract_target_lang(system_text: str) -> str | None:
+    """从系统提示词里解析目标语言；解析不出返回 None 由调用方兜底。"""
+    for pattern in _TARGET_LANG_PATTERNS:
+        matched = pattern.search(system_text or "")
+        if matched:
+            lang = matched.group(1).strip()
+            if lang:
+                return lang
+    return None
+
+
 @app.post("/local/v1/chat/completions")
 async def local_chat_completions(request: Request) -> JSONResponse:
     """OpenAI 兼容代理：前端与既有管线无需改动即可使用本地模型。
@@ -283,23 +333,41 @@ async def local_chat_completions(request: Request) -> JSONResponse:
     if not local_model.status()["ready"]:
         return JSONResponse({"error": "本地模型未就绪，请先在翻译设置中启动它。"}, status_code=409)
 
-    target_lang = payload.get("targetLang") or "简体中文"
+    # 语言来源优先级：显式字段（若有客户端会发）→ 系统提示词里的文案 → 兜底。
+    # 只认字段会让本地模型永远译成中文，只认提示词则在文案变动后静默失效，
+    # 所以两条都留着，并且解析失败时记一条日志，别让回归变成哑巴错误。
+    target_lang = payload.get("targetLang") or _extract_target_lang(str(system_text))
+    if not target_lang:
+        logger.warning("无法从系统提示词解析目标语言，回退为简体中文：%r", str(system_text)[:120])
+        target_lang = "简体中文"
     glossary = _extract_glossary_from_system(str(system_text))
 
     # 批量协议：<1>段一 <2>段二 …
     segs = re.findall(r"<(\d+)>([\s\S]*?)(?=<\d+>|$)", user_text)
     loop = asyncio.get_running_loop()
 
+    # 同时在飞的生成不超过 llama-server 的槽位数（信号量挂在引擎单例上）
     def run(text: str) -> str:
-        return local_model.translate(text, str(target_lang), glossary)
+        with local_model.slots:
+            return local_model.translate(text, str(target_lang), glossary)
+
+    def run_batch(items: list[tuple[str, str]]) -> str:
+        """逐段翻译并按编号回填；段与段之间并发。
+
+        小模型单段串行时一页要 ~20 秒，4 路并发后约 9 秒（实测 2.3 倍）——
+        瓶颈是内存带宽而不是线程数，多序列才喂得饱它。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .local_model import PARALLEL_SLOTS
+
+        with ThreadPoolExecutor(max_workers=min(PARALLEL_SLOTS, len(items))) as pool:
+            outs = list(pool.map(lambda it: run(it[1].strip()), items))
+        return "\n".join(f"<{idx}>{out}" for (idx, _), out in zip(items, outs))
 
     try:
         if segs:
-            parts: list[str] = []
-            for idx, seg in segs:
-                out = await loop.run_in_executor(None, run, seg.strip())
-                parts.append(f"<{idx}>{out}")
-            content = "\n".join(parts)
+            content = await loop.run_in_executor(None, run_batch, segs)
         else:
             content = await loop.run_in_executor(None, run, user_text)
     except Exception as err:  # noqa: BLE001
@@ -320,3 +388,21 @@ def local_models() -> dict:
 
     name = local_model.status().get("model") or "local-model"
     return {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "local"}]}
+
+
+@app.post("/debug/log")
+async def debug_log(request: Request) -> dict:
+    """接收前端调试日志（右键翻译链路排查），追加写入临时文件。"""
+    import tempfile
+    from datetime import datetime
+
+    try:
+        payload = await request.json()
+        lines = payload.get("lines", [])
+        log_file = Path(tempfile.gettempdir()) / "tr-frontend-debug.log"
+        with log_file.open("a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(str(line) + "\n")
+        return {"ok": True, "count": len(lines)}
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": str(err)}

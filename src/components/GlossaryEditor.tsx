@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, Loader2, Plus, Save, Sparkles, Trash2, Upload } from "lucide-react";
 import {
+  engineEnsure,
   glossaryExportCsv,
   glossaryImportCsv,
   glossaryList,
@@ -27,6 +28,8 @@ export function GlossaryEditor({ onExtractTerms }: { onExtractTerms?: () => Prom
   useEffect(() => {
     void (async () => {
       try {
+        // 词条存在引擎的数据目录里，没有引擎什么都读不到：打开时按需拉起
+        await engineEnsure();
         setEntries(await glossaryList());
       } catch (err) {
         setStatus((err as Error).message);

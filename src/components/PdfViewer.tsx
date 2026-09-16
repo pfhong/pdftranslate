@@ -36,6 +36,8 @@ type Size = { w: number; h: number };
 type Props = {
   doc: PDFDocumentProxy;
   zoom: number;
+  /** 首次布局完成后跳到这一页（历史记录续读用），只生效一次 */
+  initialPage?: number;
   onPageChange: (page: number) => void;
   onFitScaleChange: (scale: number) => void;
   onRenderError: (page: number, message: string) => void;
@@ -44,6 +46,7 @@ type Props = {
   onWheelZoom?: (dir: 1 | -1) => void;
   /** 右键「翻译此页」：返回当前右键所在页码 */
   onContextTranslatePage?: (page: number) => void;
+  onContextTranslateAll?: () => void;
   ref?: Ref<PdfViewerHandle>;
 };
 
@@ -51,12 +54,14 @@ type Props = {
 export function PdfViewer({
   doc,
   zoom,
+  initialPage,
   onPageChange,
   onFitScaleChange,
   onRenderError,
   onTextSelection,
   onWheelZoom,
   onContextTranslatePage,
+  onContextTranslateAll,
   ref,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -98,13 +103,18 @@ export function PdfViewer({
   }, [base, zoom, containerWidth]);
 
   // 监听容器宽度（轻微防抖，避免拖拽窗口时频繁重排）
+  // 页签切换时容器会变成 display:none（clientWidth 0），此时忽略测量：
+  // 否则 scale 归零会让所有页画布卸载，切回来要整页重绘、白屏闪一下
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     let timer = 0;
     const update = () => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => setContainerWidth(el.clientWidth), 120);
+      timer = window.setTimeout(() => {
+        const width = el.clientWidth;
+        if (width > 0) setContainerWidth(width);
+      }, 120);
     };
     update();
     const ro = new ResizeObserver(update);
@@ -169,25 +179,45 @@ export function PdfViewer({
   }, []);
 
   const scrollToPage = useCallback(
-    (n: number) => {
+    (n: number, smooth = true) => {
       const el = containerRef.current;
       if (!el || !base) return;
       let top = TOP_PAD;
       for (let i = 1; i < n; i++) {
         top += (dimsRef.current.get(i) ?? base).h * scaleRef.current + PAGE_GAP;
       }
-      el.scrollTo({ top: Math.max(0, top - 8), behavior: "smooth" });
+      el.scrollTo({ top: Math.max(0, top - 8), behavior: smooth ? "smooth" : "auto" });
     },
     [base],
   );
   useImperativeHandle(ref, () => ({ scrollToPage }), [scrollToPage]);
 
+  // 首屏定位（历史记录续读）：必须等 scale 真正算出来再滚。
+  // 容器宽度要等 ResizeObserver（120ms 防抖）才有值，在那之前 scale 为 0、
+  // 页面容器还没有可滚动高度，此时滚动会被钳制成 0，而"只滚一次"的标记已经置位。
+  const initialScrolledRef = useRef(false);
+  useEffect(() => {
+    if (initialScrolledRef.current || !base || scale <= 0 || !initialPage || initialPage <= 1) return;
+    initialScrolledRef.current = true;
+    scrollToPage(initialPage, false);
+  }, [base, scale, initialPage, scrollToPage]);
+
   // 划词：选区落在本视图的页面内时上报（视口坐标）
   // 页面右键菜单（翻译此页 / 复制页码）
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; page: number } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{
+    x: number;
+    y: number;
+    page: number;
+    onPage: boolean;
+  } | null>(null);
+  const ctxMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!ctxMenu) return;
-    const close = () => setCtxMenu(null);
+    const close = (e: Event) => {
+      // 菜单内的 mousedown 不能关菜单：按钮若在 mousedown 阶段被卸载，随后的 click 就不会到达 onClick
+      if (ctxMenuRef.current?.contains(e.target as Node | null)) return;
+      setCtxMenu(null);
+    };
     window.addEventListener("mousedown", close);
     window.addEventListener("scroll", close, true);
     return () => {
@@ -198,10 +228,9 @@ export function PdfViewer({
 
   const handleContextMenu = useCallback(
     (e: ReactMouseEvent<HTMLDivElement>) => {
-      const pageEl = (e.target as HTMLElement).closest("[data-page]") as HTMLElement | null;
-      dbg("ctx", "contextmenu event", { target: (e.target as HTMLElement).tagName, pageEl: !!pageEl, contained: containerRef.current?.contains(pageEl) ?? false, clientX: e.clientX, clientY: e.clientY });
-      if (!pageEl || !containerRef.current?.contains(pageEl)) {
-        dbg("ctx", "menu skipped: no page element");
+      dbg("ctx", "contextmenu event", { target: (e.target as HTMLElement).tagName, clientX: e.clientX, clientY: e.clientY });
+      if (!containerRef.current?.contains(e.target as HTMLElement)) {
+        dbg("ctx", "menu skipped: outside container");
         return;
       }
       // 选中文本时让出默认菜单（复制）
@@ -211,11 +240,14 @@ export function PdfViewer({
         return;
       }
       e.preventDefault();
-      dbg("ctx", "menu opened", { page: pageEl.dataset.page });
+      const pageEl = (e.target as HTMLElement).closest("[data-page]") as HTMLElement | null;
+      const onPage = !!pageEl;
+      dbg("ctx", "menu opened", { page: pageEl?.dataset.page ?? "?", onPage });
       setCtxMenu({
-        x: Math.min(e.clientX, window.innerWidth - 170),
-        y: Math.min(e.clientY, window.innerHeight - 120),
-        page: Number(pageEl.dataset.page ?? 0),
+        x: Math.min(e.clientX, window.innerWidth - 190),
+        y: Math.min(e.clientY, window.innerHeight - 150),
+        page: Number(pageEl?.dataset.page ?? 0),
+        onPage,
       });
     },
     [],
@@ -285,26 +317,38 @@ export function PdfViewer({
 
       {ctxMenu && (
         <div
+          ref={ctxMenuRef}
           className="fixed z-50 w-44 rounded-lg border border-neutral-200 bg-white p-1 shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
           style={{ left: ctxMenu.x, top: ctxMenu.y }}
         >
-          {onContextTranslatePage && (
-            <button
-              type="button"
-              className="flex w-full items-center gap-2 whitespace-nowrap rounded px-2 py-1.5 text-left text-xs text-neutral-700 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800"
-              onClick={() => {
-                dbg("ctx", "translate item clicked", { page: ctxMenu.page, hasCb: !!onContextTranslatePage });
-                if (!onContextTranslatePage) {
-                  dbg("ctx", "ERROR: onContextTranslatePage missing");
-                  return;
-                }
-                dbg("ctx", "calling onContextTranslatePage", { page: ctxMenu.page });
-                onContextTranslatePage(ctxMenu.page);
-                setCtxMenu(null);
-              }}
-            >
-              🌐 翻译第 {ctxMenu.page} 页
-            </button>
+          {ctxMenu.onPage ? (
+            onContextTranslatePage && (
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 whitespace-nowrap rounded px-2 py-1.5 text-left text-xs text-neutral-700 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                onClick={() => {
+                  dbg("ctx", "translate page item clicked", { page: ctxMenu.page });
+                  onContextTranslatePage(ctxMenu.page);
+                  setCtxMenu(null);
+                }}
+              >
+                🌐 翻译第 {ctxMenu.page} 页
+              </button>
+            )
+          ) : (
+            onContextTranslateAll && (
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 whitespace-nowrap rounded px-2 py-1.5 text-left text-xs text-neutral-700 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                onClick={() => {
+                  dbg("ctx", "translate all clicked");
+                  onContextTranslateAll();
+                  setCtxMenu(null);
+                }}
+              >
+                🌐 翻译整份文档
+              </button>
+            )
           )}
           <button
             type="button"

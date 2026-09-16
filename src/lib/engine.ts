@@ -35,15 +35,102 @@ export type EnginePage = {
 
 export type EngineExtractResult = { pages: EnginePage[]; ocrAvailable: boolean };
 
-export async function engineHealth(): Promise<boolean> {
+export type EngineHealth = {
+  online: boolean;
+  version?: string;
+  /** 引擎源码指纹：与磁盘上的 engine/*.py 不符说明跑的是旧进程 */
+  build?: string;
+  /** 引擎自己比对出的结论：进程内的代码比磁盘上的旧，需要重启引擎 */
+  stale?: boolean;
+};
+
+/**
+ * 引擎健康检查。除了"在不在线"还要带回 version/build/stale：
+ * 引擎是常驻进程，把指纹与新旧比对显示出来，
+ * 才看得出自己连的是不是磁盘上这份代码。
+ */
+export async function engineHealth(): Promise<EngineHealth> {
   try {
     const r = await fetch(`${getEngineUrl()}/health`, {
       signal: AbortSignal.timeout(2000),
     });
-    return r.ok;
+    if (!r.ok) {
+      lastHealth = { online: false };
+      return lastHealth;
+    }
+    const info = (await r.json().catch(() => ({}))) as {
+      version?: string;
+      build?: string;
+      stale?: boolean;
+    };
+    lastHealth = {
+      online: true,
+      version: info.version,
+      build: info.build,
+      stale: info.stale,
+    };
+    return lastHealth;
   } catch {
-    return false;
+    lastHealth = { online: false };
+    return lastHealth;
   }
+}
+
+// ── 引擎按需启动 ──────────────────────────────────────────────
+// 引擎不随应用启动而常驻：真正要用之前调 engineEnsure()，没起就拉起来。
+// 结果通过订阅广播给界面（状态栏的引擎指示灯据此刷新）。
+
+type EngineSubscriber = (health: EngineHealth) => void;
+const engineSubscribers = new Set<EngineSubscriber>();
+
+/** 最近一次探到的引擎状态：翻译缓存的键要用它，见 engineBuildTag() */
+let lastHealth: EngineHealth = { online: false };
+
+/**
+ * 当前引擎的源码指纹（离线时为空串）。
+ *
+ * 翻译结果缓存必须带上它：引擎行为变了（比如修好了"选西班牙语却译成中文"），
+ * 旧指纹下缓存的中文译文就会被继续命中，用户看到的还是老结果。
+ * 带上指纹后引擎一更新，缓存自然全部失效。
+ */
+export function engineBuildTag(): string {
+  return lastHealth.online ? (lastHealth.build ?? "") : "";
+}
+
+/** 订阅引擎健康变化，返回取消订阅函数 */
+export function subscribeEngine(fn: EngineSubscriber): () => void {
+  engineSubscribers.add(fn);
+  return () => engineSubscribers.delete(fn);
+}
+
+function publishEngine(health: EngineHealth): void {
+  lastHealth = health;
+  for (const fn of engineSubscribers) fn(health);
+}
+
+/**
+ * 确保引擎可用：已在线直接返回；否则请 Rust 侧拉起再复检。
+ * 所有要用引擎的动作（翻译、术语抽取、本地模型）动手前都应先 await 它，
+ * 拿到返回值再决定走引擎还是本地兜底——不能只看订阅来的状态，那是上一轮的。
+ */
+export async function engineEnsure(): Promise<EngineHealth> {
+  const current = await engineHealth();
+  if (current.online) {
+    publishEngine(current);
+    return current;
+  }
+  const { isTauri } = await import("./open-pdf");
+  if (isTauri()) {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<boolean>("ensure_engine");
+    } catch (err) {
+      console.warn("拉起翻译引擎失败", err);
+    }
+  }
+  const after = await engineHealth();
+  publishEngine(after);
+  return after;
 }
 
 export async function engineExtract(
@@ -217,6 +304,16 @@ export async function glossaryExportCsv(): Promise<string> {
 export type LocalModelStatus = {
   running: boolean;
   ready: boolean;
+  /** 就绪的模型是否由本引擎拉起；false 表示复用了外部实例（停不掉它） */
+  owned?: boolean;
+  /** 实际在用的推理设备（如 "Vulkan0: NVIDIA GeForce RTX 2060 SUPER (...)"），纯 CPU 时为 "CPU" */
+  device?: string;
+  /** 该 llama-server 能用的 GPU 设备（CPU-only 构建为空数组） */
+  gpuDevices?: string[];
+  /** 卸载到显卡的层数，0 = 纯 CPU */
+  gpuLayers?: number;
+  /** 当前 exe 用不了显卡、但发现了可用的 GPU 版时，这里给出它的路径 */
+  suggestedServerPath?: string | null;
   pid?: number | null;
   port: number;
   model: string | null;
@@ -238,11 +335,13 @@ export async function localModelStatus(): Promise<LocalModelStatus | null> {
 export async function localModelStart(
   modelPath: string,
   serverPath?: string,
+  /** 卸载层数：不传=自动（有 GPU 就全卸载）；0=强制纯 CPU */
+  gpuLayers?: number,
 ): Promise<LocalModelStatus> {
   const r = await fetch(`${getEngineUrl()}/local_model/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ modelPath, serverPath }),
+    body: JSON.stringify({ modelPath, serverPath, gpuLayers }),
   });
   const body = (await r.json()) as LocalModelStatus & { error?: string };
   if (!r.ok) throw new Error(body.error ?? `启动失败（HTTP ${r.status}）`);

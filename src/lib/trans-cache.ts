@@ -53,8 +53,21 @@ function hash(text: string): string {
   return (h >>> 0).toString(36);
 }
 
-export function cacheKey(provider: string, model: string, targetLang: string, text: string): string {
-  return `${provider}|${model}|${targetLang}|${text.length}|${hash(text)}`;
+/**
+ * 缓存键。
+ *
+ * engineBuild 是引擎的源码指纹（引擎离线时为空串）：引擎行为变了就换一套键，
+ * 否则会一直命中旧引擎产出的结果——典型症状是"选了西班牙语、却缓存了中文译文"，
+ * 修好引擎之后用户看到的仍是中文。带上指纹后引擎一更新，缓存自动整体失效。
+ */
+export function cacheKey(
+  provider: string,
+  model: string,
+  targetLang: string,
+  engineBuild: string,
+  text: string,
+): string {
+  return `${provider}|${model}|${targetLang}|${engineBuild}|${text.length}|${hash(text)}`;
 }
 
 export function cacheGet(key: string): string | null {

@@ -1,13 +1,18 @@
 import type { ReactNode } from "react";
 import { Check, Loader2, Settings, Sparkles, Square } from "lucide-react";
 import { providerLabel as noop } from "../lib/translate";
+import { TargetLangSelect, type TargetLangApi } from "./TargetLangSelect";
 import type { JobState } from "./DualView";
+import type { EngineHealth } from "../lib/engine";
 
 void noop;
 
 type Props = {
   providerName: string;
-  engineOnline: boolean;
+  /** 当前供应商的目标语言下拉 */
+  targetLang: TargetLangApi;
+  /** 引擎健康信息：在线状态、源码指纹、是否比源码旧 */
+  engine: EngineHealth;
   useGlossary: boolean;
   onToggleUseGlossary: () => void;
   anchorLayout: boolean;
@@ -93,7 +98,8 @@ function BarButton({
  */
 export function TranslationBar({
   providerName,
-  engineOnline,
+  targetLang,
+  engine,
   useGlossary,
   onToggleUseGlossary,
   anchorLayout,
@@ -122,12 +128,30 @@ export function TranslationBar({
         <Settings size={11} className="text-neutral-400" />
       </button>
 
+      <TargetLangSelect {...targetLang} />
+
       <span
-        title={engineOnline ? "Python 引擎在线（版面/OCR/合成）" : "引擎离线，使用本地兜底管线"}
+        title={
+          !engine.online
+            ? "引擎离线，使用本地兜底管线"
+            : engine.stale
+              ? `引擎进程比磁盘上的 engine/ 源码旧（build ${engine.build ?? "?"}）——` +
+                "引擎侧改动不会生效，请重启引擎（关闭应用后重新启动，或运行 engine/start.bat）"
+              : `Python 引擎在线（版面/OCR/合成）${engine.build ? ` · build ${engine.build}` : ""}`
+        }
         className="flex shrink-0 items-center gap-1 text-[11px] text-neutral-500 dark:text-neutral-400"
       >
-        <span className={`h-1.5 w-1.5 rounded-full ${engineOnline ? "bg-green-500" : "bg-neutral-400"}`} />
-        {engineOnline ? "引擎在线" : "本地管线"}
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${
+            !engine.online ? "bg-neutral-400" : engine.stale ? "bg-amber-500" : "bg-green-500"
+          }`}
+        />
+        <span className={engine.online && engine.stale ? "text-amber-600 dark:text-amber-400" : ""}>
+          {!engine.online ? "本地管线" : engine.stale ? "引擎待重启" : "引擎在线"}
+        </span>
+        {engine.online && engine.build && (
+          <span className="text-neutral-400 dark:text-neutral-500">{engine.build.slice(0, 7)}</span>
+        )}
       </span>
 
       <div className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-neutral-700" />

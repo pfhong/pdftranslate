@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Check, Loader2, Plus, Trash2, X } from "lucide-react";
 import { GlossaryEditor } from "./GlossaryEditor";
+import { AboutPanel } from "./AboutPanel";
+import { PetSettings } from "./PetSettings";
 import { LocalModelCard } from "./LocalModelCard";
 import type { GlossaryEntryDto } from "../lib/engine";
 import {
@@ -28,7 +30,7 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
   const [editingId, setEditingId] = useState<string>(config.activeId);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const [tab, setTab] = useState<"provider" | "glossary">("provider");
+  const [tab, setTab] = useState<"provider" | "glossary" | "pet" | "about">("provider");
   const [switchHint, setSwitchHint] = useState<string | null>(null);
 
   /** 切换当前使用的供应商：立即保存生效（不必再点保存按钮） */
@@ -51,6 +53,8 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
   if (!open) return null;
 
   const editing = draft.profiles.find((p) => p.id === editingId) ?? null;
+  /** 可选语言清单（内置 + 用户自定义），只随 customLangs 变化 */
+  const langsOfDraft = targetLangOptions(draft);
 
   const updateProfile = (id: string, patch: Partial<ProviderProfile>) =>
     setDraft((d) => ({
@@ -106,11 +110,11 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
     >
       <div
         className={`flex h-[480px] max-w-[95vw] flex-col rounded-xl bg-white shadow-2xl dark:bg-neutral-900 ${
-          tab === "glossary" ? "w-[760px]" : "w-[620px]"
+          tab === "glossary" ? "w-[760px]" : tab === "pet" ? "w-[600px]" : tab === "about" ? "w-[560px]" : "w-[620px]"
         }`}
       >
         <div className="flex h-11 shrink-0 items-center gap-1 border-b border-neutral-200 px-3 dark:border-neutral-800">
-          {(["provider", "glossary"] as const).map((id) => (
+          {(["provider", "glossary", "pet", "about"] as const).map((id) => (
             <button
               key={id}
               type="button"
@@ -121,7 +125,7 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
                   : "text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
               }`}
             >
-              {id === "provider" ? "翻译供应商" : "术语表"}
+              {id === "provider" ? "翻译供应商" : id === "glossary" ? "术语表" : id === "pet" ? "桌宠" : "关于"}
             </button>
           ))}
         </div>
@@ -207,7 +211,11 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
 
         {/* 右侧：编辑区 */}
         <div className="flex min-w-0 flex-1 flex-col">
-          {tab === "glossary" ? (
+          {tab === "pet" ? (
+            <PetSettings />
+          ) : tab === "about" ? (
+            <AboutPanel />
+          ) : tab === "glossary" ? (
             <GlossaryEditor onExtractTerms={onExtractTerms} />
           ) : (
           <>
@@ -275,22 +283,27 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
                 </label>
                 <label className="flex flex-col gap-1">
                   <span className="text-xs text-neutral-500 dark:text-neutral-400">
-                    目标语言（内置为本地模型原生支持的语言，也可自行添加）
+                    该供应商的目标语言（内置为本地模型原生支持的语言，也可自行添加；
+                    每个供应商各自记住自己的语言，主界面控制条上可直接切换）
                   </span>
                   <div className="flex items-center gap-2">
                     <select
-                      value={draft.targetLang}
-                      onChange={(e) => setDraft((d) => ({ ...d, targetLang: e.target.value }))}
+                      value={editing.targetLang ?? draft.targetLang}
+                      onChange={(e) =>
+                        updateProfile(editing.id, { targetLang: e.target.value })
+                      }
                       className={fieldClass}
                     >
-                      {targetLangOptions(draft).map((l) => (
+                      {langsOfDraft.map((l) => (
                         <option key={l} value={l}>
                           {l}
                           {(draft.customLangs ?? []).includes(l) ? "（自定义）" : ""}
                         </option>
                       ))}
-                      {!targetLangOptions(draft).includes(draft.targetLang) && (
-                        <option value={draft.targetLang}>{draft.targetLang}（当前）</option>
+                      {!langsOfDraft.includes(editing.targetLang ?? draft.targetLang) && (
+                        <option value={editing.targetLang ?? draft.targetLang}>
+                          {editing.targetLang ?? draft.targetLang}（当前）
+                        </option>
                       )}
                     </select>
                     <button
@@ -303,26 +316,32 @@ export function SettingsDialog({ open, config, onSave, onClose, onExtractTerms }
                         setDraft((d) => ({
                           ...d,
                           customLangs: [...(d.customLangs ?? []), lang],
-                          targetLang: lang,
+                          profiles: d.profiles.map((p) =>
+                            p.id === editing.id ? { ...p, targetLang: lang } : p,
+                          ),
                         }));
                       }}
                       className="flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-neutral-200 px-2 text-xs text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
                     >
                       <Plus size={12} /> 添加
                     </button>
-                    {(draft.customLangs ?? []).includes(draft.targetLang) && (
+                    {(draft.customLangs ?? []).includes(editing.targetLang ?? "") && (
                       <button
                         type="button"
                         title="从自定义列表中移除当前选中的语言"
                         onClick={() =>
                           setDraft((d) => {
+                            const current = editing.targetLang ?? d.targetLang;
                             const customLangs = (d.customLangs ?? []).filter(
-                              (l) => l !== d.targetLang,
+                              (l) => l !== current,
                             );
+                            const fallback = customLangs[customLangs.length - 1] ?? "简体中文";
                             return {
                               ...d,
                               customLangs,
-                              targetLang: customLangs[customLangs.length - 1] ?? "简体中文",
+                              profiles: d.profiles.map((p) =>
+                                p.id === editing.id ? { ...p, targetLang: fallback } : p,
+                              ),
                             };
                           })
                         }

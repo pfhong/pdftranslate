@@ -1,0 +1,7 @@
+{
+  "_comment": "关注二维码素材的 SHA-256 指纹（键为运行时 URL）。运行时与构建时都会校验；更换二维码图片必须同步更新这里，否则二维码不会被展示。",
+  "assets": {
+    "/about/douyin-qr.png": "f9174f3ac69fa2a51fc03b972eb72764c4102f72551cce3dde473d7ec8457ea5",
+    "/about/wechat-qr.jpg": "917da796ad267e133c0ae287300ccb54c4605211611b69da14c602cc81b2ad51"
+  }
+}

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """PP-OCRv6 (small) ONNX 推理：DB 检测 + CTC 识别。
 
-实现参考 E:/core/tools/tongming/OcrTransDesktop/ocr.py（预处理与
-PaddlePaddle 官方 inference.yml 对齐）。与原版的差异：本模块对外返回
+预处理与 PaddlePaddle 官方 inference.yml 对齐（实现思路参考了
+OcrTransDesktop 项目的 ocr.py）。与原版的差异：本模块对外返回
 「行框 + 文本」列表，供版面识别管线使用。
 """
 from __future__ import annotations

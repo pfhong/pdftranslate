@@ -13,6 +13,12 @@ export type ProviderProfile = {
   baseURL: string;
   apiKey: string;
   model: string;
+  /**
+   * 该供应商自己的目标语言。语言跟着供应商走：换供应商就带上它自己的译入语言
+   * （本地模型与在线 API 支持的语言并不一样）。
+   * 旧数据没有这个字段，读取时回退到配置级的 targetLang。
+   */
+  targetLang?: string;
   /** 内置预设不可删除 */
   preset?: boolean;
 };
@@ -85,7 +91,11 @@ export type TranslateConfig = {
   profiles: ProviderProfile[];
   /** 当前生效的供应商 id（mock 或某 profile.id） */
   activeId: string;
-  /** 目标语言描述（如“简体中文”） */
+  /**
+   * 目标语言描述（如“简体中文”）。
+   * 只作旧数据回退与"最近用的语言"镜像，真实取值看 activeProfile().targetLang，
+   * 读写统一走 activeTargetLang() / withTargetLang()。
+   */
   targetLang: string;
   /** 用户自行添加的语言（内置清单之外） */
   customLangs?: string[];
@@ -104,26 +114,31 @@ export function loadTranslateConfig(): TranslateConfig {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return structuredClone(DEFAULT_CONFIG);
     const parsed = JSON.parse(raw) as Partial<TranslateConfig>;
+    const legacyLang = parsed.targetLang ?? DEFAULT_CONFIG.targetLang;
     // 存储的供应商列表完整优先（含用户填写的 apiKey）——
     // 不能用内置预设覆盖，否则每次启动都会把密钥冲掉
-    const profiles = (parsed.profiles ?? []).map((p) =>
+    const profiles = (parsed.profiles ?? []).map((p) => {
       // 旧默认模型一次性迁移：deepseek-chat → deepseek-flash
-      p.id === "deepseek" && p.model === "deepseek-chat"
-        ? { ...p, model: "deepseek-flash" }
-        : p,
-    );
+      const migrated =
+        p.id === "deepseek" && p.model === "deepseek-chat"
+          ? { ...p, model: "deepseek-flash" }
+          : p;
+      // 语言从"配置级"下沉到"供应商级"：旧数据里所有供应商共用同一个语言，
+      // 这里一次性把它们都填成原来那个，之后每个供应商各自独立
+      return { ...migrated, targetLang: migrated.targetLang ?? legacyLang };
+    });
     if (profiles.length > 0) {
       // 补齐后来新增的内置预设（如本地模型）
       const ids = new Set(profiles.map((p) => p.id));
       for (const preset of PRESET_PROVIDERS) {
-        if (!ids.has(preset.id)) profiles.push({ ...preset });
+        if (!ids.has(preset.id)) profiles.push({ ...preset, targetLang: legacyLang });
       }
     }
     return {
       profiles:
         profiles.length > 0 ? profiles : structuredClone(DEFAULT_CONFIG.profiles),
       activeId: parsed.activeId ?? DEFAULT_CONFIG.activeId,
-      targetLang: parsed.targetLang ?? DEFAULT_CONFIG.targetLang,
+      targetLang: legacyLang,
       customLangs: parsed.customLangs ?? [],
     };
   } catch {
@@ -143,6 +158,42 @@ export function newProviderId(): string {
 export function providerLabel(config: TranslateConfig): string {
   if (config.activeId === MOCK_PROVIDER_ID) return "模拟后端";
   return config.profiles.find((p) => p.id === config.activeId)?.label ?? "未配置";
+}
+
+/** 当前生效的供应商 */
+export function activeProfile(config: TranslateConfig): ProviderProfile | undefined {
+  return config.profiles.find((p) => p.id === config.activeId);
+}
+
+/**
+ * 当前生效的目标语言——所有翻译路径都应该用它，而不是直接读 config.targetLang。
+ * 供应商没设语言时回退到配置级字段（兼容尚未迁移的数据）。
+ */
+export function activeTargetLang(config: TranslateConfig): string {
+  const perProfile = activeProfile(config)?.targetLang;
+  return perProfile?.trim() ? perProfile : config.targetLang;
+}
+
+/**
+ * 只改「当前供应商」的目标语言，并把配置级字段同步成它——
+ * 后者作为"最近使用的语言"，让日志、术语抽取等旁路读到的值与实际翻译一致。
+ */
+export function withTargetLang(config: TranslateConfig, lang: string): TranslateConfig {
+  const targetLang = lang.trim() || activeTargetLang(config);
+  return {
+    ...config,
+    targetLang,
+    profiles: config.profiles.map((p) =>
+      p.id === config.activeId ? { ...p, targetLang } : p,
+    ),
+  };
+}
+
+/** 把某个语言加入自定义清单（已存在则原样返回） */
+export function withCustomLang(config: TranslateConfig, lang: string): TranslateConfig {
+  const name = lang.trim();
+  if (!name || (config.customLangs ?? []).includes(name)) return config;
+  return { ...config, customLangs: [...(config.customLangs ?? []), name] };
 }
 
 function systemPrompt(targetLang: string): string {
@@ -331,7 +382,7 @@ export async function translateText(
   }
   const profile = config.profiles.find((p) => p.id === config.activeId);
   if (!profile) throw new Error("当前翻译供应商不存在，请打开翻译设置。");
-  return translateViaOpenAI(trimmed, profile, config.targetLang, glossaryBlock);
+  return translateViaOpenAI(trimmed, profile, activeTargetLang(config), glossaryBlock);
 }
 
 function batchSystemPrompt(targetLang: string): string {
@@ -379,10 +430,10 @@ export async function translateBatch(
         {
           role: "system",
           content: glossaryBlock
-            ? `${batchSystemPrompt(config.targetLang)}
+            ? `${batchSystemPrompt(activeTargetLang(config))}
 
 ${glossaryBlock}`
-            : batchSystemPrompt(config.targetLang),
+            : batchSystemPrompt(activeTargetLang(config)),
         },
         { role: "user", content: numbered },
       ],

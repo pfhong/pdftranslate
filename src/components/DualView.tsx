@@ -8,6 +8,8 @@ import {
 import type { PDFDocumentProxy } from "../lib/pdf";
 import { PdfViewer, type PdfViewerHandle } from "./PdfViewer";
 import { TranslationBar } from "./TranslationBar";
+import type { TargetLangApi } from "./TargetLangSelect";
+import type { EngineHealth } from "../lib/engine";
 
 export type JobState = {
   running: boolean;
@@ -28,9 +30,13 @@ type Props = {
   previewError: string | null;
   currentPage: number;
   providerLabel: string;
+  /** 当前供应商的目标语言下拉 */
+  targetLang: TargetLangApi;
   onOpenSettings: () => void;
   onTranslatePage: (page: number) => void;
-  engineOnline: boolean;
+  onTranslateAll: () => void;
+  /** 引擎健康信息（在线状态 + 源码指纹 + 是否比源码旧） */
+  engine: EngineHealth;
   forceRebuild: boolean;
   onToggleForceRebuild: () => void;
   anchorLayout: boolean;
@@ -83,9 +89,11 @@ export function DualView({
   previewError,
   currentPage,
   providerLabel,
+  targetLang,
   onOpenSettings,
   onTranslatePage,
-  engineOnline,
+  onTranslateAll,
+  engine,
   forceRebuild,
   onToggleForceRebuild,
   anchorLayout,
@@ -122,7 +130,8 @@ export function DualView({
     <div className="flex h-full flex-col">
       <TranslationBar
         providerName={providerLabel}
-        engineOnline={engineOnline}
+        targetLang={targetLang}
+        engine={engine}
         useGlossary={useGlossary}
         onToggleUseGlossary={onToggleUseGlossary}
         anchorLayout={anchorLayout}
@@ -173,6 +182,7 @@ export function DualView({
             onRenderError={onRenderError}
             onWheelZoom={onWheelZoom}
             onContextTranslatePage={onTranslatePage}
+            onContextTranslateAll={onTranslateAll}
           />
         </div>
         <div className="w-px shrink-0 bg-neutral-300 dark:bg-neutral-700" />
@@ -187,6 +197,7 @@ export function DualView({
               onRenderError={onRenderError}
               onWheelZoom={onWheelZoom}
               onContextTranslatePage={onTranslatePage}
+              onContextTranslateAll={onTranslateAll}
             />
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-3 bg-neutral-50 px-8 text-center dark:bg-neutral-950">

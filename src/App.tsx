@@ -1,70 +1,54 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Languages } from "lucide-react";
-import { Toolbar, type ViewMode } from "./components/Toolbar";
-import { PdfViewer, type PdfViewerHandle, type TextSelection } from "./components/PdfViewer";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Loader2, X } from "lucide-react";
 import { EmptyState } from "./components/EmptyState";
+import { WhalePet } from "./components/WhalePet";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { SelectionPopover } from "./components/SelectionPopover";
-import { TranslationBar } from "./components/TranslationBar";
-import { DualView, type JobState } from "./components/DualView";
-import { ReadingView, type ReadingPage, type ReadingKind } from "./components/ReadingView";
-import { loadDocument, type PDFDocumentLoadingTask, type PDFDocumentProxy, type PDFPageProxy } from "./lib/pdf";
-import { extractPageLayout, type PageLayout } from "./lib/layout";
-import { ocrPageItems } from "./lib/ocr";
+import { TabStrip, type TabItem } from "./components/TabStrip";
 import {
-  buildDualPdf,
-  buildTranslatedPdf,
-  loadFontBytes,
-  savePdfBytes,
-  type TranslationStore,
-} from "./lib/render-pdf";
-import { cacheGet, cacheKey, cacheSet } from "./lib/trans-cache";
-import { dbg } from "./lib/debug-log";
+  DocWorkspace,
+  type ReaderPrefs,
+  type RecentsApi,
+  type WorkspaceSession,
+} from "./components/DocWorkspace";
+import { loadDocument, type PDFDocumentProxy } from "./lib/pdf";
 import {
-  llmChat,
-  parseTermCandidates,
-  termExtractionPrompt,
-  loadTranslateConfig,
-  providerLabel,
-  runPool,
-  saveTranslateConfig,
-  translateBatch,
-  translateText,
-  type TranslateConfig,
-} from "./lib/translate";
-import {
+  engineEnsure,
   engineExtract,
   engineHealth,
-  engineSynthesize,
-  engineTranslateBabeldoc,
-  engineTranslateProgress,
-  glossaryActive,
   glossaryList,
-  type EngineTranslation,
+  subscribeEngine,
+  type EngineHealth,
 } from "./lib/engine";
-
-/** BabelDOC 阶段名 → 中文文案 */
-function stageLabel(stage: string, overall: number): string {
-  const map: Record<string, string> = {
-    prepare: "准备中",
-    parse_pdf: "解析 PDF",
-    detect_scanned: "检测扫描页",
-    core_document_parse: "解析文档结构",
-    document_il_parse: "版面分析（YOLO）",
-    il_translate: "翻译中",
-    llm_translate: "翻译中",
-    apply_il_translator: "应用译文",
-    parse_layout: "版面分析",
-    compose: "合成译制 PDF",
-    save_document: "保存译制 PDF",
-    finish: "正在返回译制 PDF…",
-  };
-  const label = map[stage] ?? stage;
-  return `BabelDOC · ${label} ${Math.round(overall)}%`;
-}
-
-/** 缩放档位（1 = 适应宽度） */
-const ZOOM_STEPS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+import {
+  llmChat,
+  activeTargetLang,
+  loadTranslateConfig,
+  parseTermCandidates,
+  saveTranslateConfig,
+  targetLangOptions,
+  termExtractionPrompt,
+  withCustomLang,
+  withTargetLang,
+  type TranslateConfig,
+} from "./lib/translate";
+import type { TargetLangApi } from "./components/TargetLangSelect";
+import { ensureLocalModel, isLocalModelProvider } from "./lib/local-model";
+import { getPetConfig, subscribePetConfig } from "./lib/pet";
+import {
+  displayName,
+  pdfFromDroppedFile,
+  pickPdfFiles,
+  readPdfByPath,
+  type PickedFile,
+} from "./lib/open-pdf";
+import {
+  clearRecentFiles,
+  forgetRecentFile,
+  loadRecentFiles,
+  rememberRecentFile,
+  updateRecentPage,
+  type RecentFile,
+} from "./lib/recent-files";
 
 type Theme = "light" | "dark";
 
@@ -74,151 +58,64 @@ function initialTheme(): Theme {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-/** 译文模式下的导出按钮（复用控制条按钮样式） */
-function TranslationBarExports({
-  onExportTranslated,
-  onExportDual,
-  canExportDual,
-}: {
-  onExportTranslated: () => void;
-  onExportDual: () => void;
-  canExportDual: boolean;
-}) {
-  const cls =
-    "flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-neutral-200 px-2 text-[11px] text-neutral-600 transition-colors hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800";
-  return (
-    <>
-      <button type="button" className={cls} onClick={onExportTranslated}>
-        导出译文 PDF
-      </button>
-      <button type="button" className={cls} onClick={onExportDual} disabled={!canExportDual}>
-        导出双语对照
-      </button>
-    </>
-  );
+function readPrefs(): ReaderPrefs {
+  return {
+    forceRebuild: false,
+    anchorLayout: localStorage.getItem("tr-anchor-layout") !== "0",
+    useGlossary: localStorage.getItem("tr-use-glossary") !== "0",
+    readingFontSize: Number(localStorage.getItem("tr-read-font") ?? 16),
+    readingOriginal: localStorage.getItem("tr-read-original") === "1",
+  };
 }
 
+function newId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Windows 路径大小写不敏感，判重用同一套规则 */
+function samePath(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  return a.trim().replace(/[\\/]+$/, "").toLowerCase() === b.trim().replace(/[\\/]+$/, "").toLowerCase();
+}
+
+/**
+ * 应用壳层：负责"有哪些文档打开着"、打开与关闭、打开历史记录，以及跨文档共享的偏好。
+ * 每个文档的实际状态都在 DocWorkspace 里，切页签只是把它藏起来而不卸载。
+ */
 export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
-  const docTaskRef = useRef<PDFDocumentLoadingTask | null>(null);
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [page, setPage] = useState(1);
-  const [zoom, setZoom] = useState(1);
-  const [fitScale, setFitScale] = useState(1);
-  const [dragging, setDragging] = useState(false);
-  const [renderError, setRenderError] = useState<string | null>(null);
-
-  // 翻译相关状态
-  const [selection, setSelection] = useState<TextSelection | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [prefs, setPrefs] = useState<ReaderPrefs>(readPrefs);
   const [translateConfig, setTranslateConfig] = useState<TranslateConfig>(loadTranslateConfig);
-  const configRef = useRef(translateConfig);
-  useEffect(() => {
-    configRef.current = translateConfig;
-  }, [translateConfig]);
-
-  // 双语对照与整本翻译管线
-  const [viewMode, setViewMode] = useState<ViewMode>("source");
-  const viewModeRef = useRef<ViewMode>("source");
-  useEffect(() => {
-    viewModeRef.current = viewMode;
-  }, [viewMode]);
-  const docBytesRef = useRef<Uint8Array | null>(null);
-  const [forceRebuild, setForceRebuild] = useState(false);
-  // 术语表：翻译前按文档全文取命中词条，注入提示词（BabelDOC 模式由引擎自行注入）
-  const [useGlossary, setUseGlossary] = useState(
-    () => localStorage.getItem("tr-use-glossary") !== "0",
-  );
-  const toggleUseGlossary = useCallback(() => {
-    setUseGlossary((v) => {
-      localStorage.setItem("tr-use-glossary", v ? "0" : "1");
-      return !v;
-    });
-  }, []);
-  // 锚定合成：译文保持原文段落位置（扫描件推荐）；关闭则用 BabelDOC 重排
-  const [anchorLayout, setAnchorLayout] = useState(
-    () => localStorage.getItem("tr-anchor-layout") !== "0",
-  );
-  const toggleAnchorLayout = useCallback(() => {
-    setAnchorLayout((v) => {
-      localStorage.setItem("tr-anchor-layout", v ? "0" : "1");
-      return !v;
-    });
-  }, []);
-  const toggleForceRebuild = useCallback(() => setForceRebuild((v) => !v), []);
-
-  const layoutsRef = useRef<Map<number, PageLayout>>(new Map());
-  const translationsRef = useRef<TranslationStore>(new Map());
-  const translatedBytesRef = useRef<Uint8Array | null>(null);
-  const [translatedDoc, setTranslatedDoc] = useState<PDFDocumentProxy | null>(null);
-  const translatedTaskRef = useRef<PDFDocumentLoadingTask | null>(null);
-  const enginePagesRef = useRef<import("./lib/engine").EngineExtractResult | null>(null);
-  const dualBytesRef = useRef<Uint8Array | null>(null);
-
-  function base64ToBytes(b64: string): Uint8Array {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
-  }
-  const [translatedPages, setTranslatedPages] = useState(0);
-  /** 译文版本号：每轮翻译完成后自增，用于让阅读视图刷新（译文存在 ref 中） */
-  const [translatedVersion, setTranslatedVersion] = useState(0);
-  // 阅读视图偏好（字号 / 是否逐段对照原文）
-  const [readingFontSize, setReadingFontSize] = useState(
-    () => Number(localStorage.getItem("tr-read-font") ?? 16),
-  );
-  const [readingOriginal, setReadingOriginal] = useState(
-    () => localStorage.getItem("tr-read-original") === "1",
-  );
-  const [job, setJob] = useState<JobState | null>(null);
-  const jobCancelRef = useRef(false);
-  /** BabelDOC 运行期间轮询引擎进度（阶段文案 + 总进度条） */
-  const pollBabeldocProgress = useCallback((signal: { stop: boolean }) => {
-    const timer = window.setInterval(() => {
-      if (signal.stop) {
-        window.clearInterval(timer);
-        return;
-      }
-      void engineTranslateProgress().then((p) => {
-        if (signal.stop || !p || p.error) return;
-        setJob({
-          running: true,
-          doneBlocks: Math.round(p.overall),
-          totalBlocks: 100,
-          phase: 'translate' as const,
-          stageText: stageLabel(p.stage, p.overall),
-        });
-      });
-    }, 1200);
-    return () => {
-      signal.stop = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [engine, setEngine] = useState<EngineHealth>({ online: false });
   const [fontMissing, setFontMissing] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [engineOnline, setEngineOnline] = useState(false);
-  const engineRef = useRef(false);
 
+  const [sessions, setSessions] = useState<WorkspaceSession[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [tabStatus, setTabStatus] = useState<Record<string, { running: boolean; translated: boolean }>>({});
+  const [loading, setLoading] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [petOn, setPetOn] = useState(() => getPetConfig().enabled);
+  const [recents, setRecents] = useState<RecentFile[]>(loadRecentFiles);
+
+  const sessionsRef = useRef(sessions);
   useEffect(() => {
-    void engineHealth().then((ok) => {
-      engineRef.current = ok;
-      setEngineOnline(ok);
-    });
-  }, []);
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
+  /** 术语抽取需要"当前文档"的字节，从激活会话取 */
+  const activeBytesRef = useRef<Uint8Array | null>(null);
   useEffect(() => {
-    void loadFontBytes().then((bytes) => setFontMissing(bytes === null));
-  }, []);
+    activeBytesRef.current = sessions.find((s) => s.id === activeId)?.bytes ?? null;
+  }, [sessions, activeId]);
 
-  const inputRef = useRef<HTMLInputElement>(null);
-  const viewerRef = useRef<PdfViewerHandle>(null);
-  const numPages = doc?.numPages ?? 0;
+  const activeSession = sessions.find((s) => s.id === activeId) ?? null;
+
+  // 桌宠开关在设置里改，这里订阅后即时生效
+  useEffect(() => subscribePetConfig((c) => setPetOn(c.enabled)), []);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -226,297 +123,281 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    document.title = fileName ? `${fileName} - Transfer Reader` : "Transfer Reader";
-  }, [fileName]);
+    document.title = activeSession ? `${activeSession.name} - Transfer Reader` : "Transfer Reader";
+  }, [activeSession]);
 
-  const openPicker = useCallback(() => inputRef.current?.click(), []);
-
-  const openFile = useCallback(async (file: File) => {
-    if (file.type !== "application/pdf" && !/\.pdf$/i.test(file.name)) {
-      setError("请选择 PDF 格式的文件");
-      return;
-    }
-    setError(null);
-    setLoading(true);
-    setRenderError(null);
-    try {
-      const data = new Uint8Array(await file.arrayBuffer());
-      // pdf.js 会 transfer 底层缓冲区，先留一份原始字节供译制 PDF 合成
-      docBytesRef.current = data.slice();
-      layoutsRef.current = new Map();
-      translationsRef.current = new Map();
-      translatedBytesRef.current = null;
-      setTranslatedDoc(null);
-      setTranslatedPages(0);
-      setJob(null);
-      setSelection(null);
-      const task = loadDocument(data);
-      const next = await task.promise;
-      const old = docTaskRef.current;
-      docTaskRef.current = task;
-      setDoc(next);
-      // 临时调试钩子（诊断版面识别用）
-      (window as unknown as Record<string, unknown>).__trDebug = {
-        getPage: (n: number) => next.getPage(n),
-        extractPageLayout,
-      };
-      setFileName(file.name.replace(/\.pdf$/i, ""));
-      setPage(1);
-      setZoom(1);
-      void old?.destroy();
-    } catch (err) {
-      console.error(err);
-      setError("无法打开该 PDF 文件");
-    } finally {
-      setLoading(false);
-    }
+  // 引擎由 Rust 侧在启动时拉起，就绪要几秒，所以启动后重试若干次
+  // 引擎按需启动：启动时只探一次（可能是"另一个实例已经在跑"）。
+  // 之后谁要用引擎，谁先 engineEnsure()，结果通过订阅广播回来刷新这里。
+  useEffect(() => {
+    const unsubscribe = subscribeEngine(setEngine);
+    void engineHealth().then(setEngine);
+    return unsubscribe;
   }, []);
 
-  const gotoPage = useCallback(
-    (n: number) => {
-      const clamped = Math.min(Math.max(n, 1), Math.max(numPages, 1));
-      setPage(clamped);
-      viewerRef.current?.scrollToPage(clamped);
+  useEffect(() => {
+    void import("./lib/render-pdf").then(({ loadFontBytes }) =>
+      loadFontBytes().then((bytes) => setFontMissing(bytes === null)),
+    );
+  }, []);
+
+  const updatePrefs = useCallback((patch: Partial<ReaderPrefs>) => {
+    setPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.anchorLayout !== undefined) {
+        localStorage.setItem("tr-anchor-layout", patch.anchorLayout ? "1" : "0");
+      }
+      if (patch.useGlossary !== undefined) {
+        localStorage.setItem("tr-use-glossary", patch.useGlossary ? "1" : "0");
+      }
+      if (patch.readingFontSize !== undefined) {
+        localStorage.setItem("tr-read-font", String(patch.readingFontSize));
+      }
+      if (patch.readingOriginal !== undefined) {
+        localStorage.setItem("tr-read-original", patch.readingOriginal ? "1" : "0");
+      }
+      return next;
+    });
+  }, []);
+
+  const saveTranslateSettings = useCallback((next: TranslateConfig) => {
+    // 配置级 targetLang 只作"最近用的语言"镜像：保存时与当前供应商的语言对齐，
+    // 这样任何旁路读到它的地方（日志、术语抽取）都不会和实际翻译用的语言不一致
+    const normalized: TranslateConfig = { ...next, targetLang: activeTargetLang(next) };
+    setTranslateConfig(normalized);
+    saveTranslateConfig(normalized);
+  }, []);
+
+  const changeTargetLang = useCallback(
+    (lang: string) => {
+      setTranslateConfig((prev) => {
+        const next = withTargetLang(prev, lang);
+        saveTranslateConfig(next);
+        return next;
+      });
     },
-    [numPages],
+    [],
   );
 
-  const zoomIn = useCallback(() => {
-    setZoom((z) => ZOOM_STEPS.find((s) => s > z + 1e-6) ?? z);
-  }, []);
-  const zoomOut = useCallback(() => {
-    setZoom((z) => [...ZOOM_STEPS].reverse().find((s) => s < z - 1e-6) ?? z);
+  const addTargetLang = useCallback(
+    (lang: string) => {
+      setTranslateConfig((prev) => {
+        const next = withTargetLang(withCustomLang(prev, lang), lang);
+        saveTranslateConfig(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  /** 打开一批已读入内存的 PDF，每个文件一个页签 */
+  const openPicked = useCallback(
+    async (
+      picked: PickedFile[],
+      opts?: { page?: number; remember?: boolean; errors?: string[] },
+    ) => {
+      if (picked.length === 0 && !opts?.errors?.length) return;
+      setLoading(true);
+      const errors = [...(opts?.errors ?? [])];
+      try {
+        for (let i = 0; i < picked.length; i++) {
+          const file = picked[i];
+          const resumePage = i === 0 ? (opts?.page ?? 1) : 1;
+          // 同一路径已在页签里 → 直接切过去，不重复打开
+          const opened = sessionsRef.current.find((s) => samePath(s.path, file.path));
+          if (opened) {
+            setActiveId(opened.id);
+            continue;
+          }
+          try {
+            // pdf.js 会 transfer 底层缓冲区，先留一份原始字节供译制 PDF 合成
+            const kept = file.bytes.slice();
+            const task = loadDocument(file.bytes);
+            const doc: PDFDocumentProxy = await task.promise;
+            const name = displayName(file.name);
+            const session: WorkspaceSession = {
+              id: newId(),
+              name,
+              path: file.path,
+              bytes: kept,
+              doc,
+              task,
+              initialPage: resumePage,
+            };
+            setSessions((prev) => [...prev, session]);
+            setActiveId(session.id);
+            if (file.path && opts?.remember !== false) {
+              setRecents(rememberRecentFile({ path: file.path, name, page: resumePage }));
+            }
+          } catch (err) {
+            console.error(err);
+            errors.push(`无法打开 ${file.name}`);
+          }
+        }
+      } finally {
+        setLoading(false);
+        // 打开成功就顺手清掉上一次的失败提示，失败的则合并展示
+        setOpenError(errors.length > 0 ? errors.join("；") : null);
+      }
+    },
+    [],
+  );
+
+  const openPicker = useCallback(async () => {
+    try {
+      const { files, errors } = await pickPdfFiles();
+      await openPicked(files, { errors });
+    } catch (err) {
+      console.error(err);
+      setOpenError(`打开失败：${(err as Error).message ?? String(err)}`);
+    }
+  }, [openPicked]);
+
+  /** 从历史记录重开：文件可能已被移动或删除，这里要给出可读的提示 */
+  const openRecent = useCallback(
+    async (entry: RecentFile) => {
+      setOpenError(null);
+      const already = sessionsRef.current.find((s) => samePath(s.path, entry.path));
+      if (already) {
+        setActiveId(already.id);
+        return;
+      }
+      setLoading(true);
+      try {
+        const file = await readPdfByPath(entry.path);
+        await openPicked([file], { page: entry.page ?? 1 });
+      } catch (err) {
+        console.error(err);
+        setOpenError(`无法打开 ${entry.name}，文件可能已被移动或删除：${(err as Error).message ?? String(err)}`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [openPicked],
+  );
+
+  const closeSession = useCallback((id: string) => {
+    const list = sessionsRef.current;
+    const idx = list.findIndex((s) => s.id === id);
+    if (idx < 0) return;
+    const target = list[idx];
+    setSessions((prev) => prev.filter((s) => s.id !== id));
+    setActiveId((cur) => {
+      if (cur !== id) return cur;
+      const neighbour = list[idx + 1] ?? list[idx - 1];
+      return neighbour?.id ?? null;
+    });
+    setTabStatus((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    // 等 React 卸载该工作区之后再释放 pdf.js 资源，避免销毁与渲染竞争
+    window.setTimeout(() => void target.task.destroy(), 0);
   }, []);
 
-  // 全局快捷键
+  const cycleTab = useCallback((dir: 1 | -1) => {
+    const list = sessionsRef.current;
+    if (list.length < 2) return;
+    const idx = list.findIndex((s) => s.id === activeId);
+    const next = list[(idx + dir + list.length) % list.length];
+    setActiveId(next.id);
+  }, [activeId]);
+
+  // 全局快捷键：打开、关闭页签、切换页签
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key.toLowerCase() === "o") {
+      if (!mod) return;
+      const key = e.key.toLowerCase();
+      if (key === "o") {
         e.preventDefault();
-        openPicker();
-        return;
-      }
-      if (!doc) return;
-      if (e.key === "ArrowLeft" || e.key === "PageUp") {
+        void openPicker();
+      } else if (key === "w") {
+        if (!activeId) return;
         e.preventDefault();
-        gotoPage(page - 1);
-      } else if (e.key === "ArrowRight" || e.key === "PageDown") {
+        closeSession(activeId);
+      } else if (e.key === "Tab") {
+        if (sessionsRef.current.length < 2) return;
         e.preventDefault();
-        gotoPage(page + 1);
-      } else if (mod && (e.key === "=" || e.key === "+")) {
-        e.preventDefault();
-        zoomIn();
-      } else if (mod && e.key === "-") {
-        e.preventDefault();
-        zoomOut();
-      } else if (mod && e.key === "0") {
-        e.preventDefault();
-        setZoom(1);
+        cycleTab(e.shiftKey ? -1 : 1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [doc, page, gotoPage, zoomIn, zoomOut, openPicker]);
+  }, [activeId, closeSession, cycleTab, openPicker]);
 
-  const zoomPercent = Math.round(fitScale * zoom * 100);
-
-  // 划词结果上报（滚动/取消选择时也会传 null）
-  const handleTextSelection = useCallback((sel: TextSelection | null) => {
-    setSelection(sel);
-  }, []);
-
-  const saveTranslateSettings = useCallback((next: TranslateConfig) => {
-    setTranslateConfig(next);
-    saveTranslateConfig(next);
-  }, []);
-
-  // ─── 整本翻译管线 ───────────────────────────────────────────
-
-  /** 获取一页版面：OCR 开启时用 PP-OCR 重新识别，否则用内嵌文本层 */
-  const getLayout = useCallback(
-    async (pg: PDFPageProxy, pageNum: number): Promise<PageLayout> => {
-      const cached = layoutsRef.current.get(pageNum);
-      if (cached) return cached;
-      let layout: PageLayout;
-      if (forceRebuild) {
-        setJob((j) => (j ? { ...j, phase: "ocr" } : j));
-        const items = await ocrPageItems(pg);
-        layout = await extractPageLayout(pg, { itemsOverride: items });
-      } else {
-        layout = await extractPageLayout(pg);
-      }
-      layoutsRef.current.set(pageNum, layout);
-      return layout;
-    },
-    [forceRebuild],
-  );
-
-  const countTranslatedPages = useCallback(() => {
-    let n = 0;
-    for (const blocks of translationsRef.current.values()) {
-      if (blocks.size > 0) n += 1;
-    }
-    return n;
-  }, []);
-
-  /** 批量翻译目标段落：8 段/批 + 4 路并发，缺失项逐段兜底重试 */
-  const translateTargets = useCallback(
-    async (targets: { page: number; id: number; text: string }[]) => {
-      // 一页一次请求：模型能看到整页上下文，译法更一致、段落衔接更自然；
-      // 页与页之间仍并发（见下方 runPool 的 limit）。超长页再按字符数切分。
-      const PAGE_MAX_CHARS = 6000;
-      const byPage = new Map<number, number[]>();
-      targets.forEach((t, i) => {
-        const list = byPage.get(t.page) ?? [];
-        list.push(i);
-        byPage.set(t.page, list);
+  const handleStatus = useCallback(
+    (id: string, status: { running: boolean; translated: boolean }) => {
+      setTabStatus((prev) => {
+        const cur = prev[id];
+        if (cur && cur.running === status.running && cur.translated === status.translated) {
+          return prev;
+        }
+        return { ...prev, [id]: status };
       });
-      const batches: number[][] = [];
-      for (const [, idxs] of byPage) {
-        let chars = 0;
-        let cur: number[] = [];
-        for (const i of idxs) {
-          const len = targets[i].text.length;
-          if (cur.length > 0 && chars + len > PAGE_MAX_CHARS) {
-            batches.push(cur);
-            cur = [];
-            chars = 0;
-          }
-          cur.push(i);
-          chars += len;
-        }
-        if (cur.length > 0) batches.push(cur);
-      }
-      // 术语表：只取全文命中的词条，生成提示词块（两条路径都注入；BabelDOC 由引擎注入）
-      let glossaryBlock: string | undefined;
-      const profile = configRef.current.profiles.find(
-        (p) => p.id === configRef.current.activeId,
-      );
-      if (useGlossary && profile) {
-        const entries = await glossaryActive(
-          targets.map((t) => t.text).join("\n"),
-          configRef.current.targetLang,
-        );
-        if (entries.length > 0) {
-          glossaryBlock = [
-            "## Glossary",
-            "",
-            "Always use the glossary's **Target Term** for any occurrence of its **Source Term**.",
-            "Unlisted terms are translated naturally.",
-            "",
-            "| Source Term | Target Term |",
-            "|-------------|-------------|",
-            ...entries.map(([src, tgt]) => `| ${src} | ${tgt} |`),
-          ].join("\n");
-        }
-      }
-      const model = profile?.model ?? "";
-      const providerId = configRef.current.activeId;
-      let done = 0;
-      await runPool(
-        batches,
-        6,
-        async (batch) => {
-          const texts = batch.map((i) => targets[i].text);
-          const keys = texts.map((t) =>
-            cacheKey(providerId, model, configRef.current.targetLang, t),
-          );
-          const results: (string | null)[] = keys.map((k) => cacheGet(k));
-          const pending = texts
-            .map((_t, k) => (results[k] === null ? k : -1))
-            .filter((k) => k >= 0);
-          if (pending.length > 0) {
-            let fresh: (string | null)[] = [];
-            try {
-              fresh = await translateBatch(
-                pending.map((k) => texts[k]),
-                configRef.current,
-                glossaryBlock,
-              );
-            } catch (err) {
-              console.warn("批量翻译失败，降级为逐段", err);
-              fresh = pending.map(() => null);
-            }
-            pending.forEach((k, idx) => {
-              const value = fresh[idx];
-              results[k] = value;
-              if (value) cacheSet(keys[k], value);
-            });
-          }
-          for (let k = 0; k < batch.length; k++) {
-            if (results[k] === null) {
-              try {
-                results[k] = await translateText(texts[k], configRef.current, glossaryBlock);
-                if (results[k]) cacheSet(keys[k], results[k] as string);
-              } catch (err) {
-                console.warn(`第 ${targets[batch[k]].page} 页段落翻译失败`, err);
-              }
-            }
-          }
-          for (let k = 0; k < batch.length; k++) {
-            const t = targets[batch[k]];
-            if (results[k] !== null) {
-              const pageTrans = translationsRef.current.get(t.page) ?? new Map<number, string>();
-              translationsRef.current.set(t.page, pageTrans);
-              pageTrans.set(t.id, results[k] as string);
-            }
-            done += 1;
-            setJob((j) => (j ? { ...j, doneBlocks: done } : j));
-          }
-          setTranslatedPages(countTranslatedPages());
-          setTranslatedVersion((v) => v + 1);
-        },
-        () => jobCancelRef.current,
-      );
     },
-    [countTranslatedPages, useGlossary],
+    [],
   );
 
-  /** 提取整本文档的版面并汇总待翻译段落（引擎优先，本地管线降级） */
-  const collectTargets = useCallback(async (): Promise<{ page: number; id: number; text: string }[] | null> => {
-    const allTargets: { page: number; id: number; text: string }[] = [];
-    if (engineRef.current && docBytesRef.current) {
-      const result = await engineExtract(docBytesRef.current);
-      enginePagesRef.current = result;
-      for (const pg of result.pages) {
-        for (const b of pg.blocks) {
-          if (b.text.trim()) allTargets.push({ page: pg.pageNumber, id: b.index, text: b.text });
-        }
+  // 阅读进度写回历史记录：滚动很频繁，所以攒一会儿再落盘
+  const pageRef = useRef(new Map<string, number>());
+  const progressTimerRef = useRef(0);
+  const handlePage = useCallback((id: string, page: number) => {
+    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!session?.path) return;
+    pageRef.current.set(session.path, page);
+    window.clearTimeout(progressTimerRef.current);
+    progressTimerRef.current = window.setTimeout(() => {
+      let latest: RecentFile[] | null = null;
+      for (const [path, p] of pageRef.current) {
+        latest = updateRecentPage(path, p) ?? latest;
       }
-      return allTargets;
-    }
-    if (!doc) return null;
-    for (let p = 1; p <= numPages; p++) {
-      if (jobCancelRef.current) return null;
-      const pg = await doc.getPage(p);
-      const layout = await getLayout(pg, p);
-      for (const b of layout.blocks) {
-        if (!b.protectedOnly && b.translateText.trim()) {
-          allTargets.push({ page: p, id: b.id, text: b.translateText });
-        }
-      }
-    }
-    return allTargets;
-  }, [doc, numPages, getLayout]);
+      pageRef.current.clear();
+      if (latest) setRecents(latest);
+    }, 1500);
+  }, []);
 
-  /**
-   * 术语自动抽取：引擎提取文档文本 → 模型给出候选术语对。
-   * 只在内存中返回候选，由用户在设置里审阅后保存（不自动写入）。
-   */
-  const extractTerms = useCallback(async (): Promise<
-    { source: string; target: string }[]
-  > => {
-    if (!docBytesRef.current) throw new Error("请先打开 PDF 文件。");
-    const profile = configRef.current.profiles.find(
-      (p) => p.id === configRef.current.activeId,
-    );
-    if (!profile || configRef.current.activeId === "mock") {
+  const tabs: TabItem[] = sessions.map((s) => ({
+    id: s.id,
+    name: s.name,
+    running: tabStatus[s.id]?.running ?? false,
+    translated: tabStatus[s.id]?.translated ?? false,
+  }));
+
+  const recentsApi: RecentsApi = {
+    list: recents,
+    onOpen: (entry) => void openRecent(entry),
+    onForget: (path) => setRecents(forgetRecentFile(path)),
+    onClear: () => setRecents(clearRecentFiles()),
+  };
+
+  const targetLangApi: TargetLangApi = {
+    value: activeTargetLang(translateConfig),
+    options: targetLangOptions(translateConfig),
+    onChange: changeTargetLang,
+    onAdd: addTargetLang,
+  };
+
+  /** 术语自动抽取：引擎提取文本 → 模型给出候选，仅供设置页审阅 */
+  const extractTerms = useCallback(async (): Promise<{ source: string; target: string }[]> => {
+    const bytes = activeBytesRef.current;
+    if (!bytes) throw new Error("请先打开 PDF 文件。");
+    const profile = translateConfig.profiles.find((p) => p.id === translateConfig.activeId);
+    if (!profile || translateConfig.activeId === "mock") {
       throw new Error("术语抽取需要真实翻译供应商，请先在「翻译供应商」页配置。");
     }
-    const extracted = await engineExtract(docBytesRef.current);
+    // 抽取靠引擎的版面识别，没起就先拉起（引擎不常驻）；
+    // 供应商是本地模型时，模型本身也得在跑，否则一样的 409
+    const engine = await engineEnsure();
+    if (engine.online && isLocalModelProvider(profile.baseURL)) {
+      const model = await ensureLocalModel();
+      if (!model.ok) throw new Error(model.message ?? "本地模型未能启动。");
+    }
+    const extracted = await engineExtract(bytes);
     const text = extracted.pages
       .flatMap((p) => p.blocks.map((b) => b.text))
       .filter((t) => t.trim())
@@ -527,417 +408,25 @@ export default function App() {
     const raw = await llmChat(
       [
         { role: "system", content: "你是严谨的文档术语抽取器，只输出 JSON。" },
-        { role: "user", content: termExtractionPrompt(text, configRef.current.targetLang) },
+        { role: "user", content: termExtractionPrompt(text, activeTargetLang(translateConfig)) },
       ],
-      configRef.current,
+      translateConfig,
     );
     const candidates = parseTermCandidates(raw);
 
     // 去重：排除已在术语表中的源词，并按文档中出现的频次排序
     const existing = new Set((await glossaryList()).map((e) => e.source.trim().toLowerCase()));
     const seen = new Set<string>();
-    const scored = candidates
+    return candidates
       .map((c) => {
         const key = c.source.trim().toLowerCase();
         const occurrences = text.toLowerCase().split(key).length - 1;
         return { ...c, key, occurrences };
       })
       .filter((c) => c.key && !existing.has(c.key) && !seen.has(c.key) && (seen.add(c.key), true))
-      .sort((a, b) => b.occurrences - a.occurrences);
-    return scored.map(({ source, target }) => ({ source, target }));
-  }, []);
-
-  /** 用当前缓存重新合成译制 PDF 并加载到右栏 */
-  const rebuildPreview = useCallback(async () => {
-    try {
-      // 引擎路径：PyMuPDF redaction + htmlbox 合成
-      if (engineRef.current && docBytesRef.current && translationsRef.current.size > 0) {
-        const translations: EngineTranslation[] = [];
-        for (const [pg, blocks] of translationsRef.current) {
-          const pageData = enginePagesRef.current?.pages.find((p) => p.pageNumber === pg);
-          if (!pageData) continue;
-          for (const [block, text] of blocks) {
-            const blk = pageData.blocks.find((b) => b.index === block);
-            if (!blk) continue;
-            translations.push({
-              page: pg,
-              block,
-              bbox: blk.bbox,
-              lines: blk.lines.map((l) => l.bbox),
-              text,
-            });
-          }
-        }
-        if (translations.length > 0) {
-          const bytes = await engineSynthesize(docBytesRef.current, translations);
-          // pdf.js 会 transfer 缓冲区，留一份字节用于导出
-          translatedBytesRef.current = bytes.slice();
-          const task = loadDocument(bytes);
-          const next = await task.promise;
-          const oldTask = translatedTaskRef.current;
-          translatedTaskRef.current = task;
-          setTranslatedDoc(next);
-          void oldTask?.destroy();
-          setPreviewError(null);
-          return;
-        }
-      }
-      if (!docBytesRef.current) return;
-      const bytes = await buildTranslatedPdf(docBytesRef.current, {
-        layouts: layoutsRef.current,
-        translations: translationsRef.current,
-      });
-      if (!bytes) {
-        setFontMissing((await loadFontBytes()) === null);
-        return;
-      }
-      // pdf.js 会 transfer 缓冲区，留一份字节用于导出
-      translatedBytesRef.current = bytes.slice();
-      const task = loadDocument(bytes);
-      const next = await task.promise;
-      const oldTask = translatedTaskRef.current;
-    translatedTaskRef.current = task;
-    setTranslatedDoc(next);
-    void oldTask?.destroy();
-    setPreviewError(null);
-    } catch (err) {
-      console.error("译制 PDF 合成失败", err);
-      setPreviewError((err as Error).message ?? String(err));
-    }
-  }, []);
-
-  /** 锚定合成：引擎提取版面 → 逐段翻译 → 引擎合成（译文保留原文段落位置） */
-  const translateAnchored = useCallback(
-    async (onlyPage?: number) => {
-      dbg("anchored", "start", { onlyPage: onlyPage ?? null });
-      if (!doc || !docBytesRef.current) {
-        dbg("anchored", "abort: no doc/bytes");
-        return;
-      }
-      const profile = translateConfig.profiles.find((p) => p.id === translateConfig.activeId);
-      if (translateConfig.activeId === "mock" || !profile) {
-        setPreviewError("需要真实翻译后端，请在翻译设置中选择并配置供应商。");
-        return;
-      }
-      try {
-        setJob({ running: true, doneBlocks: 0, totalBlocks: 0, phase: "layout" });
-        dbg("anchored", "extracting via engine", { forceRebuild });
-        const extracted = await engineExtract(docBytesRef.current, forceRebuild);
-        dbg("anchored", "extract done", { pages: extracted.pages.length, modes: extracted.pages.map((p) => p.mode).join(",") });
-        enginePagesRef.current = extracted;
-        const pagesToDo = onlyPage
-          ? extracted.pages.filter((p) => p.pageNumber === onlyPage)
-          : extracted.pages;
-        const targets = pagesToDo.flatMap((p) =>
-          p.blocks
-            .filter((b) => b.text.trim())
-            .map((b) => ({ page: p.pageNumber, id: b.index, text: b.text })),
-        );
-        dbg("anchored", "translating targets", { count: targets.length });
-        setJob({ running: true, doneBlocks: 0, totalBlocks: targets.length, phase: "translate" });
-        await translateTargets(targets);
-        dbg("anchored", "targets translated", { done: targets.length });
-        // 汇总译文 → 引擎按原段落框合成
-        const translations: EngineTranslation[] = [];
-        for (const [pg, blocks] of translationsRef.current) {
-          const pageData = extracted.pages.find((p) => p.pageNumber === pg);
-          if (!pageData) continue;
-          for (const [block, text] of blocks) {
-            const blk = pageData.blocks.find((b) => b.index === block);
-            if (!blk) continue;
-            translations.push({
-              page: pg,
-              block,
-              bbox: blk.bbox,
-              lines: blk.lines.map((l) => l.bbox),
-              text,
-            });
-          }
-        }
-        dbg("anchored", "synthesizing", { translations: translations.length });
-        const mono = await engineSynthesize(docBytesRef.current, translations);
-        dbg("anchored", "synthesized", { bytes: mono.length });
-        translatedBytesRef.current = mono.slice();
-        const task = loadDocument(mono);
-        const next = await task.promise;
-        const oldTask = translatedTaskRef.current;
-        translatedTaskRef.current = task;
-        setTranslatedDoc(next);
-        void oldTask?.destroy();
-        dualBytesRef.current = null;
-        setTranslatedPages((n) => Math.max(n, onlyPage ?? numPages));
-        setPreviewError(null);
-        // 刚翻译完就把视图切到译文：用户翻译的目的通常是读译文（再点一下即可切回原文）
-        if (viewModeRef.current === "source") setViewMode("target");
-      } catch (err) {
-        console.error(err);
-        setPreviewError((err as Error).message ?? String(err));
-      } finally {
-        setJob(null);
-      }
-    },
-    [doc, numPages, translateConfig, forceRebuild, translateTargets],
-  );
-
-  /**
-   * 阅读视图数据：把识别出的块按阅读顺序整理成段落，并带上译文。
-   * 只依赖版面识别 + 译文，不参与 PDF 合成——因此不受原段落框约束。
-   */
-  /** 估算各栏正文左边界：取出现次数最多的两个 x0（双栏页会有两个） */
-  const bodyMargins = (xs: number[]): number[] => {
-    const buckets = new Map<number, number>();
-    for (const x of xs) {
-      const key = Math.round(x / 4) * 4;
-      buckets.set(key, (buckets.get(key) ?? 0) + 1);
-    }
-    return [...buckets.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 2)
-      .map(([k]) => k);
-  };
-
-  const classifyKind = (
-    bold: boolean,
-    x0: number,
-    margins: number[],
-    text: string,
-    isProtected: boolean,
-  ): ReadingKind => {
-    if (isProtected) return "formula";
-    if (bold) return "heading";
-    const nearest = margins.reduce(
-      (best, m) => (Math.abs(x0 - m) < Math.abs(x0 - best) ? m : best),
-      margins[0] ?? 0,
-    );
-    // 相对最近栏边界缩进且不是长段落 → 视为引文/缩进块
-    return x0 - nearest > 20 && text.length < 400 ? "quote" : "paragraph";
-  };
-
-  const readingPages: ReadingPage[] = useMemo(() => {
-    void translatedVersion; // 依赖译文版本，翻译完成后重算
-    const out: ReadingPage[] = [];
-    const engine = enginePagesRef.current;
-    const trans = translationsRef.current;
-
-    if (engine) {
-      for (const pg of engine.pages) {
-        const raw = pg.blocks.filter(
-          (b) => (b.text ?? "").trim() || b.lines.some((l) => (l.text ?? "").trim()),
-        );
-        if (raw.length === 0) continue;
-        const margins = bodyMargins(raw.map((b) => b.bbox[0]));
-        const pageTrans = trans.get(pg.pageNumber);
-        out.push({
-          page: pg.pageNumber,
-          translated: (pageTrans?.size ?? 0) > 0,
-          blocks: raw.map((b) => {
-            const text = (b.text ?? "").trim();
-            const original = text || b.lines.map((l) => l.text ?? "").join(" ");
-            const kind = classifyKind(
-              !!b.bold,
-              b.bbox[0],
-              margins,
-              original,
-              !text,
-            );
-            return {
-              id: b.index,
-              kind,
-              original,
-              translated: pageTrans?.get(b.index),
-            };
-          }),
-        });
-      }
-      return out;
-    }
-
-    // 本地兜底管线：layoutsRef（PageLayout）
-    for (const [page, layout] of layoutsRef.current) {
-      const raw = layout.blocks;
-      if (raw.length === 0) continue;
-      const margins = bodyMargins(raw.map((b) => b.x0));
-      const pageTrans = trans.get(page);
-      out.push({
-        page,
-        translated: (pageTrans?.size ?? 0) > 0,
-        blocks: raw.map((b) => {
-          const original = b.protectedOnly ? b.displayText : b.translateText;
-          const kind = classifyKind(
-            b.size > layout.blocks[0].size * 1.08 && original.length < 80,
-            b.x0,
-            margins,
-            original,
-            b.protectedOnly,
-          );
-          return { id: b.id, kind, original, translated: pageTrans?.get(b.id) };
-        }),
-      });
-    }
-    out.sort((a, b) => a.page - b.page);
-    return out;
-  }, [translatedVersion]);
-
-  const translateAll = useCallback(async () => {
-    if (!doc || job?.running) return;
-    jobCancelRef.current = false;
-    // 引擎在线：整本翻译走 BabelDOC 完整管线（YOLO 版面 + 字符级重排）
-    if (anchorLayout) {
-      await translateAnchored();
-      return;
-    }
-    if (engineRef.current && docBytesRef.current) {
-      const profile = translateConfig.profiles.find((p) => p.id === translateConfig.activeId);
-      if (translateConfig.activeId === "mock" || !profile) {
-        setPreviewError("BabelDOC 需要真实翻译后端，请在翻译设置中选择并配置供应商。");
-        return;
-      }
-      setJob({ running: true, doneBlocks: 0, totalBlocks: 0, phase: "layout" });
-      const pollSignal = { stop: false };
-      const stopPolling = pollBabeldocProgress(pollSignal);
-      try {
-        const result = await engineTranslateBabeldoc(
-          docBytesRef.current,
-          {
-            baseUrl: profile.baseURL,
-            apiKey: profile.apiKey,
-            model: profile.model,
-          },
-          { targetLangName: translateConfig.targetLang, forceRebuild, useGlossary },
-        );
-        if (result.mono) {
-          const monoBytes = base64ToBytes(result.mono);
-          translatedBytesRef.current = monoBytes.slice();
-          const task = loadDocument(monoBytes);
-          const next = await task.promise;
-          const oldTask = translatedTaskRef.current;
-          translatedTaskRef.current = task;
-          setTranslatedDoc(next);
-          void oldTask?.destroy();
-        }
-        if (result.dual) {
-          dualBytesRef.current = base64ToBytes(result.dual);
-        }
-        setTranslatedPages((n) => Math.max(n, numPages));
-        setPreviewError(null);
-        if (viewModeRef.current === "source") setViewMode("target");
-      } catch (err) {
-        console.error(err);
-        setPreviewError((err as Error).message ?? String(err));
-      } finally {
-        stopPolling();
-        setJob(null);
-      }
-      return;
-    }
-    setJob({ running: true, doneBlocks: 0, totalBlocks: 0, phase: forceRebuild ? "ocr" : "layout" });
-    const targets = await collectTargets();
-    if (!targets || jobCancelRef.current) {
-      setJob(null);
-      return;
-    }
-    setJob({ running: true, doneBlocks: 0, totalBlocks: targets.length, phase: "translate" });
-    await translateTargets(targets);
-    setJob(null);
-    await rebuildPreview();
-  }, [doc, job, translateConfig, collectTargets, translateTargets, rebuildPreview]);
-
-  /** 翻译指定页（默认当前页）。右键菜单会传入右键所在的页码。 */
-  const translateCurrent = useCallback(async (targetPage?: number) => {
-    dbg("translateCurrent", "invoked", { targetPage, currentPage: page, engine: engineRef.current, anchor: anchorLayout, hasBytes: !!docBytesRef.current });
-    if (!doc || job?.running) {
-      dbg("translateCurrent", "skipped", { noDoc: !doc, jobRunning: job?.running ?? false });
-      return;
-    }
-    const pageNo = targetPage ?? page;
-    if (pageNo < 1 || pageNo > numPages) {
-      dbg("translateCurrent", "page out of range", { pageNo, numPages });
-      return;
-    }
-    jobCancelRef.current = false;
-    // 引擎在线：当前页也走 BabelDOC 完整管线（pages 参数只译本页），质量与整本一致
-    if (anchorLayout) {
-      dbg("translateCurrent", "route: anchored");
-      await translateAnchored(pageNo);
-      return;
-    }
-    if (engineRef.current && docBytesRef.current) {
-      const profile = translateConfig.profiles.find((p) => p.id === translateConfig.activeId);
-      if (translateConfig.activeId === "mock" || !profile) {
-        setPreviewError("BabelDOC 需要真实翻译后端，请在翻译设置中选择并配置供应商。");
-        return;
-      }
-      setJob({ running: true, doneBlocks: 0, totalBlocks: 0, phase: "layout" });
-      const pollSignal = { stop: false };
-      const stopPolling = pollBabeldocProgress(pollSignal);
-      try {
-        const result = await engineTranslateBabeldoc(
-          docBytesRef.current,
-          {
-            baseUrl: profile.baseURL,
-            apiKey: profile.apiKey,
-            model: profile.model,
-          },
-          { targetLangName: translateConfig.targetLang, pages: String(pageNo), forceRebuild, useGlossary },
-        );
-        if (result.mono) {
-          const monoBytes = base64ToBytes(result.mono);
-          translatedBytesRef.current = monoBytes.slice();
-          const task = loadDocument(monoBytes);
-          const next = await task.promise;
-          const oldTask = translatedTaskRef.current;
-          translatedTaskRef.current = task;
-          setTranslatedDoc(next);
-          void oldTask?.destroy();
-        }
-        if (result.dual) {
-          dualBytesRef.current = base64ToBytes(result.dual);
-        }
-        setTranslatedPages((n) => Math.max(n, pageNo));
-        setPreviewError(null);
-        if (viewModeRef.current === "source") setViewMode("target");
-      } catch (err) {
-        console.error(err);
-        setPreviewError((err as Error).message ?? String(err));
-      } finally {
-        stopPolling();
-        setJob(null);
-      }
-      return;
-    }
-    setJob({ running: true, doneBlocks: 0, totalBlocks: 0, phase: forceRebuild ? "ocr" : "layout" });
-    const pg = await doc.getPage(page);
-    const layout = await getLayout(pg, page);
-    const targets = layout.blocks
-      .filter((b) => !b.protectedOnly && b.translateText.trim())
-      .map((b) => ({ page, id: b.id, text: b.translateText }));
-    setJob({ running: true, doneBlocks: 0, totalBlocks: targets.length, phase: "translate" });
-    await translateTargets(targets);
-    setJob(null);
-    await rebuildPreview();
-  }, [doc, job, page, translateConfig, getLayout, translateTargets, rebuildPreview]);
-
-  const cancelJob = useCallback(() => {
-    jobCancelRef.current = true;
-  }, []);
-
-  const exportTranslated = useCallback(async () => {
-    const bytes = translatedBytesRef.current;
-    if (!bytes) return;
-    await savePdfBytes(bytes.slice(), `${fileName ?? "document"}_译文.pdf`);
-  }, [fileName]);
-
-  const exportDual = useCallback(async () => {
-    // BabelDOC 已生成原生 dual（原/译交错），直接导出
-    if (dualBytesRef.current) {
-      await savePdfBytes(dualBytesRef.current.slice(), `${fileName ?? "document"}_双语对照.pdf`);
-      return;
-    }
-    const bytes = translatedBytesRef.current;
-    if (!bytes || !docBytesRef.current) return;
-    const dual = await buildDualPdf(docBytesRef.current, bytes);
-    await savePdfBytes(dual, `${fileName ?? "document"}_双语对照.pdf`);
-  }, [fileName]);
+      .sort((a, b) => b.occurrences - a.occurrences)
+      .map(({ source, target }) => ({ source, target }));
+  }, [translateConfig]);
 
   return (
     <div
@@ -952,169 +441,89 @@ export default function App() {
       onDrop={(e) => {
         e.preventDefault();
         setDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file) void openFile(file);
+        const files = Array.from(e.dataTransfer.files ?? []);
+        if (files.length === 0) return;
+        void (async () => {
+          const picked: PickedFile[] = [];
+          for (const f of files) {
+            const one = await pdfFromDroppedFile(f);
+            if (one) picked.push(one);
+          }
+          await openPicked(picked, {
+            errors: picked.length === 0 ? ["请拖入 PDF 格式的文件"] : [],
+          });
+        })();
       }}
     >
-      <input
-        ref={inputRef}
-        type="file"
-        accept="application/pdf,.pdf"
-        className="hidden"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) void openFile(file);
-          e.target.value = "";
-        }}
-      />
-
-      <Toolbar
-        fileName={fileName}
-        page={page}
-        numPages={numPages}
-        zoomPercent={zoomPercent}
-        theme={theme}
-        disabled={!doc}
-        onOpenClick={openPicker}
-        onPrevPage={() => gotoPage(page - 1)}
-        onNextPage={() => gotoPage(page + 1)}
-        onGotoPage={gotoPage}
-        onZoomIn={zoomIn}
-        onZoomOut={zoomOut}
-        onZoomReset={() => setZoom(1)}
-        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-        viewMode={viewMode}
-        onViewModeChange={setViewMode}
-      />
-
-      {doc && viewMode !== "dual" && (
-        <TranslationBar
-          providerName={providerLabel(translateConfig)}
-          engineOnline={engineOnline}
-          useGlossary={useGlossary}
-          onToggleUseGlossary={toggleUseGlossary}
-          anchorLayout={anchorLayout}
-          onToggleAnchorLayout={toggleAnchorLayout}
-          forceRebuild={forceRebuild}
-          onToggleForceRebuild={toggleForceRebuild}
-          showAnchorLayout={viewMode !== "read"}
-          job={job}
-          onTranslateAll={() => void translateAll()}
-          onCancel={cancelJob}
-          onOpenSettings={() => setSettingsOpen(true)}
-          translatedPages={translatedPages}
-          numPages={numPages}
-        >
-          {viewMode === "target" && translationsRef.current.size > 0 && (
-            <TranslationBarExports
-              onExportTranslated={() => void exportTranslated()}
-              onExportDual={() => void exportDual()}
-              canExportDual={!!translatedBytesRef.current}
-            />
-          )}
-        </TranslationBar>
+      {sessions.length === 0 ? (
+        <main className="min-h-0 flex-1">
+          <EmptyState
+            onOpenClick={() => void openPicker()}
+            loading={loading}
+            error={openError}
+            recents={recents}
+            onOpenRecent={(entry) => void openRecent(entry)}
+            onForgetRecent={(path) => setRecents(forgetRecentFile(path))}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        </main>
+      ) : (
+        <>
+          <TabStrip
+            tabs={tabs}
+            activeId={activeId ?? ""}
+            onSelect={setActiveId}
+            onClose={closeSession}
+            onOpenFiles={() => void openPicker()}
+          />
+          {/* 每个文档都保持挂载，只把非激活的藏起来：译文、版面缓存、滚动位置都留着 */}
+          {sessions.map((s) => (
+            <div
+              key={s.id}
+              className={s.id === activeId ? "flex min-h-0 flex-1 flex-col" : "hidden"}
+            >
+              <DocWorkspace
+                session={s}
+                active={s.id === activeId}
+                prefs={prefs}
+                onPrefsChange={updatePrefs}
+                translateConfig={translateConfig}
+                targetLang={targetLangApi}
+                onOpenSettings={() => setSettingsOpen(true)}
+                engine={engine}
+                fontMissing={fontMissing}
+                theme={theme}
+                onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                onOpenFiles={() => void openPicker()}
+                recents={recentsApi}
+                onStatus={handleStatus}
+                onPage={handlePage}
+              />
+            </div>
+          ))}
+        </>
       )}
 
-      <main className="min-h-0 flex-1">
-        {doc && viewMode === "read" ? (
-          <ReadingView
-            pages={readingPages}
-            providerLabel={providerLabel(translateConfig)}
-            fontSize={readingFontSize}
-            onFontSizeChange={(d) => {
-              setReadingFontSize((v) => {
-                const next = Math.max(13, Math.min(22, v + d));
-                localStorage.setItem("tr-read-font", String(next));
-                return next;
-              });
-            }}
-            showOriginal={readingOriginal}
-            onToggleOriginal={() => {
-              setReadingOriginal((v) => {
-                localStorage.setItem("tr-read-original", v ? "0" : "1");
-                return !v;
-              });
-            }}
-            activePage={page}
-            onActivePageChange={setPage}
-          />
-        ) : doc && viewMode === "target" ? (
-          translatedDoc ? (
-            <PdfViewer
-              doc={translatedDoc}
-              zoom={zoom}
-              onPageChange={setPage}
-              onFitScaleChange={setFitScale}
-              onRenderError={(n, msg) => setRenderError(`第 ${n} 页渲染失败：${msg}`)}
-              onTextSelection={handleTextSelection}
-              onWheelZoom={(dir) => (dir > 0 ? zoomIn() : zoomOut())}
-              onContextTranslatePage={(p) => void translateCurrent(p)}
-            />
-          ) : (
-            <div className="flex h-full flex-col items-center justify-center gap-3 bg-neutral-50 px-8 text-center dark:bg-neutral-950">
-              <Languages size={26} className="text-neutral-300 dark:text-neutral-600" />
-              <p className="max-w-sm text-sm leading-relaxed text-neutral-500 dark:text-neutral-400">
-                还没有译文。先在下方翻译面板里点「翻译第 N 页」或工具栏的「翻译整份文档」，
-                完成后这里会显示译制 PDF；也可以切到「对照」模式并排阅读。
-              </p>
-            </div>
-          )
-        ) : doc && viewMode === "dual" ? (
-          <DualView
-            doc={doc}
-            translatedDoc={translatedDoc}
-            job={job}
-            translatedPages={translatedPages}
-            hasTranslations={translationsRef.current.size > 0}
-            fontMissing={fontMissing}
-            previewError={previewError}
-            currentPage={page}
-            providerLabel={providerLabel(translateConfig)}
-            onOpenSettings={() => setSettingsOpen(true)}
-            engineOnline={engineOnline}
-            forceRebuild={forceRebuild}
-            onToggleForceRebuild={toggleForceRebuild}
-            anchorLayout={anchorLayout}
-            useGlossary={useGlossary}
-            onToggleUseGlossary={toggleUseGlossary}
-            zoom={zoom}
-            onFitScaleChange={setFitScale}
-            onWheelZoom={(dir) => (dir > 0 ? zoomIn() : zoomOut())}
-            onRenderError={(n, msg) => setRenderError(`第 ${n} 页渲染失败：${msg}`)}
-            onToggleAnchorLayout={toggleAnchorLayout}
-            onPageChange={setPage}
-            onStartAll={() => void translateAll()}
-            onCancel={cancelJob}
-            onTranslatePage={(p) => void translateCurrent(p)}
-            onRefreshPreview={() => void rebuildPreview()}
-            onExportTranslated={() => void exportTranslated()}
-            onExportDual={() => void exportDual()}
-          />
-        ) : doc ? (
-          <PdfViewer
-            ref={viewerRef}
-            doc={doc}
-            zoom={zoom}
-            onPageChange={setPage}
-            onFitScaleChange={setFitScale}
-            onRenderError={(n, msg) => setRenderError(`第 ${n} 页渲染失败：${msg}`)}
-            onTextSelection={handleTextSelection}
-            onWheelZoom={(dir) => (dir > 0 ? zoomIn() : zoomOut())}
-            onContextTranslatePage={(p) => void translateCurrent(p)}
-          />
-        ) : (
-          <EmptyState onOpenClick={openPicker} loading={loading} error={error} />
-        )}
-      </main>
+      {loading && sessions.length > 0 && (
+        <div className="pointer-events-none fixed inset-x-0 top-14 z-40 flex justify-center">
+          <span className="flex items-center gap-2 rounded-full bg-neutral-900/85 px-3 py-1.5 text-xs text-white shadow-lg">
+            <Loader2 size={12} className="animate-spin" />
+            正在打开…
+          </span>
+        </div>
+      )}
 
-      {selection && (
-        <SelectionPopover
-          text={selection.text}
-          rect={selection.rect}
-          config={translateConfig}
-          onOpenSettings={() => setSettingsOpen(true)}
-          onClose={() => setSelection(null)}
-        />
+      {openError && sessions.length > 0 && (
+        <div className="flex shrink-0 items-center gap-2 border-t border-red-200 bg-red-50 px-4 py-2 text-xs text-red-600 dark:border-red-900 dark:bg-red-950/60 dark:text-red-400">
+          <span className="min-w-0 flex-1 truncate">{openError}</span>
+          <button
+            type="button"
+            onClick={() => setOpenError(null)}
+            className="shrink-0 rounded px-1.5 py-0.5 hover:bg-red-100 dark:hover:bg-red-900/40"
+          >
+            <X size={12} />
+          </button>
+        </div>
       )}
 
       <SettingsDialog
@@ -1125,18 +534,7 @@ export default function App() {
         onClose={() => setSettingsOpen(false)}
       />
 
-      {renderError && (
-        <div className="flex shrink-0 items-center gap-2 border-t border-red-200 bg-red-50 px-4 py-2 text-xs text-red-600 dark:border-red-900 dark:bg-red-950/60 dark:text-red-400">
-          <span className="min-w-0 flex-1 truncate">{renderError}</span>
-          <button
-            type="button"
-            onClick={() => setRenderError(null)}
-            className="shrink-0 rounded px-1.5 py-0.5 hover:bg-red-100 dark:hover:bg-red-900/40"
-          >
-            关闭
-          </button>
-        </div>
-      )}
+      {petOn && <WhalePet />}
 
       {dragging && (
         <div className="pointer-events-none fixed inset-3 z-50 flex items-center justify-center rounded-2xl border-2 border-dashed border-blue-500 bg-blue-500/10">

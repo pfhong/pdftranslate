@@ -16,6 +16,12 @@ export function dbg(scope: string, message: string, extra?: unknown): void {
     const log: string[] = raw ? JSON.parse(raw) : [];
     log.push(line);
     localStorage.setItem(KEY, JSON.stringify(log.slice(-MAX)));
+    // 同时上报引擎（桌面版排查用；静默失败）
+    void fetch("http://127.0.0.1:8765/debug/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lines: [line] }),
+    }).catch(() => {});
   } catch {
     /* 忽略存储错误 */
   }

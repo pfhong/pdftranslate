@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node scripts/verify-qr.mjs && tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "verify:qr": "node scripts/verify-qr.mjs"
   },
   "dependencies": {
     "@gutenye/ocr-browser": "^1.4.8",

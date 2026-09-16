@@ -5,10 +5,21 @@ import {
   ChevronRight,
   FolderOpen,
   Moon,
+  Settings,
   Sun,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { RecentFilesMenu } from "./RecentFilesMenu";
+import type { RecentFile } from "../lib/recent-files";
+
+/** 打开历史记录的数据与回调，从壳层逐层透传到这里 */
+export type RecentsApi = {
+  list: RecentFile[];
+  onOpen: (entry: RecentFile) => void;
+  onForget: (path: string) => void;
+  onClear: () => void;
+};
 
 type Props = {
   fileName: string | null;
@@ -27,6 +38,8 @@ type Props = {
   onToggleTheme: () => void;
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
+  recents: RecentsApi;
+  onOpenSettings: () => void;
 };
 
 /** 阅读模式：原文 / 原文+译文对照 / 仅译文 */
@@ -73,6 +86,8 @@ export function Toolbar({
   onToggleTheme,
   viewMode,
   onViewModeChange,
+  recents,
+  onOpenSettings,
 }: Props) {
   const [pageInput, setPageInput] = useState(String(page));
   useEffect(() => setPageInput(String(page)), [page]);
@@ -87,7 +102,10 @@ export function Toolbar({
   };
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-2 border-b border-neutral-200 bg-white/80 px-3 backdrop-blur dark:border-neutral-800 dark:bg-neutral-900/80">
+    // relative + z-30 是必需的：backdrop-blur 会让 header 自己成为一个层叠上下文，
+    // 若不给它显式层级，header 只在"z-index:0"这一层参与绘制，而它在 DOM 里排在 main 之前，
+    // 于是历史记录下拉会被 PDF 页面（页容器 position:relative、pdf.js 文本层 absolute）盖住。
+    <header className="relative z-30 flex h-12 shrink-0 items-center gap-2 border-b border-neutral-200 bg-white/80 px-3 backdrop-blur dark:border-neutral-800 dark:bg-neutral-900/80">
       {/* 左侧：文件名 */}
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <img src="/logo.svg" alt="" className="h-6 w-6 shrink-0" draggable={false} />
@@ -171,6 +189,12 @@ export function Toolbar({
             </button>
           ))}
         </div>
+        <RecentFilesMenu
+          list={recents.list}
+          onOpen={recents.onOpen}
+          onForget={recents.onForget}
+          onClear={recents.onClear}
+        />
         <IconButton title="打开文件 (Ctrl+O)" onClick={onOpenClick}>
           <FolderOpen size={16} />
         </IconButton>
@@ -179,6 +203,9 @@ export function Toolbar({
           onClick={onToggleTheme}
         >
           {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+        </IconButton>
+        <IconButton title="设置（翻译供应商 / 术语表 / 关于）" onClick={onOpenSettings}>
+          <Settings size={16} />
         </IconButton>
       </div>
     </header>
