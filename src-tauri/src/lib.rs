@@ -44,15 +44,24 @@ fn spawn_engine() {
         .open(&log_path)
         .ok();
 
-    for py in ["python", "py"].iter() {
-        for root in &candidates {
-            if !root.join("engine").join("main.py").exists() {
-                continue;
-            }
-            let mut cmd = Command::new(py);
-            if py == &"py" {
-                cmd.arg("-3");
-            }
+    for root in &candidates {
+        if !root.join("engine").join("main.py").exists() {
+            continue;
+        }
+        // 绿色版：包内自带嵌入式 Python（<exe_dir>/engine_root/python/python.exe），
+        // 有就直接用，用户不必自己装 Python；没有才回退系统的 python / py
+        let bundled = root.join("python").join("python.exe");
+        let interpreters: Vec<(std::ffi::OsString, Vec<&str>)> = if bundled.is_file() {
+            vec![(bundled.into_os_string(), Vec::new())]
+        } else {
+            vec![
+                (std::ffi::OsString::from("python"), Vec::new()),
+                (std::ffi::OsString::from("py"), vec!["-3"]),
+            ]
+        };
+        for (py, pre_args) in interpreters {
+            let mut cmd = Command::new(&py);
+            cmd.args(&pre_args);
             cmd.args([
                 "-m",
                 "uvicorn",
@@ -78,7 +87,9 @@ fn spawn_engine() {
                     let msg = format!(
                         "{}: spawned {} from {}
 ",
-                        chrono_now(), py, root.display()
+                        chrono_now(),
+                        py.to_string_lossy(),
+                        root.display()
                     );
                     if let Some(f) = log.as_mut() {
                         use std::io::Write;
@@ -90,7 +101,10 @@ fn spawn_engine() {
                     let msg = format!(
                         "{}: spawn {} from {} failed: {}
 ",
-                        chrono_now(), py, root.display(), e
+                        chrono_now(),
+                        py.to_string_lossy(),
+                        root.display(),
+                        e
                     );
                     if let Some(f) = log.as_mut() {
                         use std::io::Write;

@@ -104,6 +104,22 @@ pnpm tauri build
 
 产物位于 `src-tauri/target/release/bundle/`。
 
+### 绿色版（免安装）
+
+```bash
+pnpm tauri build          # 先出生产版 exe（必须用 CLI；cargo build 编出来的是开发版）
+node scripts/make-portable.mjs
+```
+
+产出 `release/TransferReader-<版本>-portable-win64.zip`（约 230MB）。包里除了 exe，还带：
+
+- `engine_root/engine/` 引擎源码 + 自带 llama.cpp 运行时（CPU / Vulkan）+ PP-OCR 模型
+- `engine_root/python/` **嵌入式 Python + 引擎依赖** —— 这就是"绿色"的部分：目标机器不需要装 Python
+
+应用拉起引擎时会优先用包内的 `engine_root/python/python.exe`（没有才回退系统的 python / py）。
+依赖只装引擎运行必需的（`fastapi/uvicorn/pymupdf/onnxruntime/numpy/opencv-python-headless/requests`）；
+`rapidocr` 代码里没用到故未装，BabelDOC 属可选高级管线，使用说明里给了按需安装命令。
+
 ## 目录结构
 
 ```

@@ -5,3 +5,4 @@ rapidocr-onnxruntime>=1.4
 onnxruntime>=1.17
 numpy
 opencv-python-headless
+requests

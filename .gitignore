@@ -33,3 +33,6 @@ engine/.venv/
 
 # engine data (术语表等本地数据)
 engine/data/
+
+# 绿色版打包产物
+release/
