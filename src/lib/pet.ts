@@ -5,6 +5,8 @@
  * 所以用这个极小的订阅式 store（配置存在 localStorage，不往组件树里塞）。
  */
 
+import { dbg } from "./debug-log";
+
 const KEY = "tr-pet-whale";
 
 /** 可展示区域：窗口底部升沉 / 窗口两侧滑动 / 界面控件上沿探头 */
@@ -143,6 +145,9 @@ export function subscribePetConfig(fn: (c: PetConfig) => void): () => void {
 
 /** 立刻让它出场一次（设置页的「召唤一下」） */
 export function triggerPet(): void {
+  // 排查"召唤没反应"：subscribers 为 0 说明桌宠组件没挂载
+  // （总开关关闭，或窗口宽度不足 700px 时组件直接不渲染）
+  dbg("pet", "召唤一下", { subscribers: triggerSubs.size, enabled: config.enabled });
   for (const fn of triggerSubs) fn();
 }
 

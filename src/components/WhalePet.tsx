@@ -11,6 +11,7 @@ import {
   type PetZone,
 } from "../lib/pet";
 import { qrSource, type QrSource } from "../lib/qr-source";
+import { dbg } from "../lib/debug-log";
 import {
   CLIPS,
   clipBox,
@@ -152,7 +153,9 @@ export function WhalePet() {
   useEffect(() => subscribePetConfig((c) => (cfgRef.current = c)), []);
 
   useEffect(() => {
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    // 系统偏好「减少动态效果」时不做逐帧动画，也不再自动出场；
+    // 但手动召唤与翻译完成播报仍然可用（静态姿势），避免桌宠"一声不响地失效"。
+    const reducedMotion = !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const stage = stageRef.current;
     const pet = petRef.current;
     const img = imgRef.current;
@@ -165,6 +168,14 @@ export function WhalePet() {
     if (!stage || !pet || !img || !bubble || !bubbleText || !bubbleQr || !bubbleAsk || !bubbleSub || !bubbleOpt)
       return;
 
+    dbg("pet", "mounted", {
+      reducedMotion,
+      innerW: window.innerWidth,
+      innerH: window.innerHeight,
+      hidden: document.hidden,
+      enabled: cfgRef.current.enabled,
+    });
+
     /**
      * 二维码取源：默认"未就绪"（不展示），加载并通过校验后才允许展示。
      * 桌面端由 Rust 提供内置图片并校验。
@@ -175,12 +186,21 @@ export function WhalePet() {
     });
 
     let runId = 0;
-    let busy = false;
     let lastClick = 0;
     let curPos = "at-bottom";
     let anchor: { el: HTMLElement; fx: number; dw: number } | null = null;
     let alive = true;
     let timer = 0;
+    let warnedHidden = false;
+    /**
+     * 出场进行中的标记：不存布尔，存"忙到什么时刻"。
+     * WebView2 在某些状态下会把页面计时器钳到分钟级，用 setTimeout 实现的
+     * 看门狗会被一起冻住，布尔锁一旦挂起就永久锁死——之后自动+手动出场
+     * 全部静默失效（"桌宠不能用"）。改成截止时间后，锁靠查时间自然过期，
+     * 不依赖任何定时器。
+     */
+    let busyUntil = 0;
+    const isBusy = () => Date.now() < busyUntil;
 
     const sleep = (ms: number, id: number) =>
       new Promise<boolean>((resolve) => {
@@ -228,7 +248,7 @@ export function WhalePet() {
     };
 
     const onScroll = () => {
-      if (!anchor || !busy) return;
+      if (!anchor || !isBusy()) return;
       applyAnchor();
     };
 
@@ -245,6 +265,14 @@ export function WhalePet() {
     const fpsOf = (name: string) =>
       name === "rise" ? CFG.fpsBottom : name === "sink" ? CFG.fpsSink : name === "expr" ? CFG.fpsExpr : CFG.fpsSide;
 
+    /** 静态模式（减少动态效果）下各片段展示的姿势：rise 取完全升起的帧，其余取末帧 */
+    const staticFrameOf = (name: string) => {
+      const n = CLIPS[name].n;
+      if (name === "rise") return Math.floor(n * 0.85);
+      if (name === "sink" || name === "slout" || name === "slback") return n - 1;
+      return 0;
+    };
+
     /**
      * 播放一段逐帧动画。
      *
@@ -257,6 +285,13 @@ export function WhalePet() {
       new Promise<boolean>((resolve) => {
         const clip = CLIPS[name];
         img.style.width = `${clip.dw}px`;
+        if (reducedMotion) {
+          // 静态姿势替代逐帧动画；rise 仍要触发"到顶说话"的回调
+          img.src = `${PET_BASE}${name}-${pad(staticFrameOf(name))}.webp`;
+          if (name === "rise") onFrame?.(WAVE_AT);
+          window.setTimeout(() => resolve(id === runId && alive), 600);
+          return;
+        }
         const per = 1000 / fpsOf(name);
         const t0 = performance.now();
         let shown = -1;
@@ -364,14 +399,14 @@ export function WhalePet() {
 
     const hide = () => {
       runId += 1;
-      busy = false;
+      busyUntil = 0;
       stage.style.zIndex = String(CFG.zFloat);
       anchor?.el.classList.remove("wp-behind");
       anchor = null;
       hideBubble();
       pet.classList.remove("on");
       window.setTimeout(() => {
-        if (!busy) clearInlinePos();
+        if (!isBusy()) clearInlinePos();
       }, 350);
     };
 
@@ -439,8 +474,12 @@ export function WhalePet() {
 
     /** force = 手动召唤：忽略频率、区域与回避限制 */
     const show = (force = false) => {
-      if (busy || !alive) return;
+      if (isBusy() || !alive) {
+        dbg("pet", "show 跳过（正忙/未挂载）", { force, busy: isBusy(), alive });
+        return;
+      }
       if (!force && document.hidden) return;
+      if (!force && reducedMotion) return; // 减少动态效果：不自动出场
       const cfg = cfgRef.current;
       let plans = buildPlans(cfg.zones, force);
       if (!force && cfg.avoidCrowded) {
@@ -450,34 +489,51 @@ export function WhalePet() {
           h: window.innerHeight,
         });
       }
-      if (plans.length === 0) return; // 这一轮静默跳过
-      busy = true;
+      if (plans.length === 0) {
+        dbg("pet", "本轮无可用位置（回避可见页面）", { force, pages: pageBoxes().length });
+        return; // 这一轮静默跳过
+      }
+      // 忙碌锁带 25 秒截止（最长正常出场 ≈17 秒 + 余量）：即使页面计时器被
+      // 系统节流冻住整条流程，锁也会到点自动过期，绝不会永久卡死
+      busyUntil = Date.now() + 25000;
       // 手动召唤多半是在设置面板里点的，而面板是 z-50：这一轮抬到面板之上，
       // 否则点了看不到它（出场结束 hide() 会把层级还原）
       if (force) stage.style.zIndex = String(CFG.zManual);
       qrShown = false;
       const id = ++runId;
       const chosen = pickWeighted(plans);
-      void runPlan(id, chosen).then((ok) => {
-        if (ok) hide();
-        else busy = false;
-      });
+      const settle = (_ok: boolean, err?: unknown) => {
+        if (id !== runId) return; // 已被新一轮接管，锁归新一轮负责
+        if (err !== undefined) dbg("pet", "出场流程异常", { error: String(err) });
+        busyUntil = 0;
+        hide();
+      };
+      try {
+        void Promise.resolve(runPlan(id, chosen)).then(
+          (ok) => settle(ok),
+          (err) => settle(false, err),
+        );
+      } catch (err) {
+        settle(false, err);
+      }
     };
 
     const onClick = () => {
+      dbg("pet", "被点了一下", { curPos });
       const now = Date.now();
       if (now - lastClick < 1200) return;
       lastClick = now;
       const id = ++runId;
-      busy = true;
+      busyUntil = Date.now() + 15000;
       if (curPos === "at-bottom") {
         showBubble(pick(QUOTES));
         pet.classList.add("on");
         void play("expr", id)
           .then((ok) => (ok ? sleep(CFG.exprHoldMs, id) : false))
           .then((ok) => {
+            if (id !== runId) return;
+            busyUntil = 0;
             if (ok) hide();
-            else busy = false;
           });
         return;
       }
@@ -486,8 +542,9 @@ export function WhalePet() {
       void sleep(500, id)
         .then((ok) => (ok ? play("slback", id) : false))
         .then((ok) => {
+          if (id !== runId) return;
+          busyUntil = 0;
           if (ok) hide();
-          else busy = false;
         });
     };
 
@@ -501,13 +558,24 @@ export function WhalePet() {
             : PET_FREQ_RANGE[cfg.frequency];
       timer = window.setTimeout(() => {
         if (!alive) return;
-        if (cfgRef.current.frequency !== "manual" && !document.hidden) show();
+        if (cfgRef.current.frequency !== "manual") {
+          if (document.hidden) {
+            // 页面隐藏时不出场；只在前两条里留痕，别刷爆环形缓冲
+            if (!warnedHidden) {
+              dbg("pet", "页面隐藏，自动出场暂停", { hidden: document.hidden });
+              warnedHidden = true;
+            }
+          } else {
+            warnedHidden = false;
+            show();
+          }
+        }
         schedule(false);
       }, rand(range[0], range[1]) * 1000);
     };
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && busy) hide();
+      if (e.key === "Escape" && isBusy()) hide();
     };
 
     pet.addEventListener("click", onClick);
@@ -525,7 +593,7 @@ export function WhalePet() {
     });
     const unsubscribeSay = subscribePetSay((text) => {
       // 已经在场就直接说；否则叫出来说（事件播报与手动召唤一样，不受频率/回避限制）
-      if (busy) {
+      if (isBusy()) {
         showBubble(text);
         return;
       }

@@ -66,6 +66,19 @@ export function PetSettings() {
       </label>
 
       <div className={cfg.enabled ? "" : "pointer-events-none opacity-40"}>
+        {/* 静默失效场景要讲清楚，别让用户以为桌宠坏了 */}
+        {typeof window !== "undefined" && window.innerWidth < 700 && (
+          <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+            当前窗口宽度不足 700px，桌宠暂时停用（窗口太小时只会碍事）；把窗口拉宽后即可恢复。
+          </p>
+        )}
+        {typeof window !== "undefined" &&
+          !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches && (
+            <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+              系统开启了「减少动态效果」：桌宠不会自动出场；「召唤一下」和翻译完成提示仍可用（静态姿势）。
+            </p>
+          )}
+
         {/* 出场频率 */}
         <h4 className="mt-4 mb-1.5 text-xs font-medium text-neutral-700 dark:text-neutral-200">出场频率</h4>
         <div className="flex flex-wrap gap-1.5">
